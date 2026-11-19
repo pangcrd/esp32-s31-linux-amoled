@@ -720,11 +720,14 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 	else if (xfer->tx_nbits == 8)
 		user |= S31_SPI_FWRITE_OCT;
 	writel(user, s->base + S31_SPI_USER);
-	/* Match IDF's zero-length phase programming.  The phases stay disabled in
-	 * USER, while their encoded length fields contain (0 - 1). */
+	/* Match IDF spi_ll_master_init(): cs_setup_time is 0 there, not the
+	 * 31-cycle maximum. (ADDR_BITLEN all-ones is correct: it encodes a
+	 * 0-bit address phase, (0 - 1), and USR_ADDR stays clear in USER,
+	 * so the phase is disabled. CS_SETUP_TIME is a time field, not a
+	 * length field, so all-ones would be a real 31-cycle delay.) */
 	writel((readl(s->base + S31_SPI_USER1) &
 		~(S31_SPI_CS_SETUP_TIME | S31_SPI_ADDR_BITLEN)) |
-	       S31_SPI_CS_SETUP_TIME | S31_SPI_ADDR_BITLEN,
+	       S31_SPI_ADDR_BITLEN,
 	       s->base + S31_SPI_USER1);
 	writel((readl(s->base + S31_SPI_USER2) &
 		~S31_SPI_COMMAND_BITLEN) | S31_SPI_COMMAND_BITLEN,

@@ -87,8 +87,12 @@ The reference sequence sets MADCTL, RGB565 COLMOD, page 0, C4, brightness
 and control registers, then Sleep Out with 120 ms settling and Display On.
 **The module supplier's initialization may differ.**
 
-The opt-in DTS uses the Espressif reference **466 x 466, x offset 6, y
-offset 0**, and a 1 MHz SPI limit. Change `chipone,width`,
+The opt-in DTS uses the C05300AF-51 module on this shield: **410 x 502,
+x offset 22, y offset 0**, with the supplier init sequence
+(FE/C4/35/53/51/63/11, 600 ms after Sleep Out) supplied through
+`chipone,init-sequence`, and a 1 MHz SPI limit. (An earlier revision used
+the Espressif reference 466 x 466, x offset 6; that geometry is wrong for
+this module and has been corrected.) Change `chipone,width`,
 `chipone,height`, offsets and reset GPIO to match the PCB before flashing.
 Framebuffer storage for that geometry is 434,312 bytes, plus deferred-I/O
 metadata and fbcon allocations.

@@ -39,7 +39,13 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 	p->command[3] = 0;
 	if (len)
 		memcpy(p->command + 4, data, len);
-	return spi_sync_transfer(p->spi, &t, 1);
+	{
+		int ret = spi_sync_transfer(p->spi, &t, 1);
+
+		dev_info(&p->spi->dev, "DIAG cmd 0x%02x len %zu -> %d\n",
+			 cmd, len, ret);
+		return ret;
+	}
 }
 
 /* One independently addressed row per message; never rely on RAMWRC
@@ -84,7 +90,17 @@ static int co5300fb_row(struct fb_info *info, u32 y)
 	p->command[2] = 0x2c;
 	p->command[3] = 0;
 	/* cs_change remains zero: CS covers the single and quad phases. */
-	return spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
+	{
+		static int rows;
+		int ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
+
+		rows++;
+		if (rows <= 3 || ret)
+			dev_info(&p->spi->dev,
+				 "DIAG row y=%u xoff=%u -> %d (row #%d)\n",
+				 y, p->xoff, ret, rows);
+		return ret;
+	}
 }
 
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
@@ -207,13 +223,23 @@ static const struct fb_ops co5300fb_ops = {
 static int co5300fb_init_sequence(struct co5300fb *p)
 {
 	static const u8 defaults[] = {
+		/* Supplier init for the C05300AF-51 410x502 module (proven
+		 * under ESP-IDF), in the supplier's order: FE, C4, 3A, 35,
+		 * 53, 51, 63, 11 (600 ms). 0x35 carries its data byte
+		 * (0x00) — sending it with no data desyncs the panel's
+		 * command parser and the commands after it (53/51/63/11/
+		 * 29) are misread, leaving the display off. 0x36 (MADCTL)
+		 * is not sent; the panel's power-up default (0x00) is the
+		 * one the ESP-IDF test uses. 0x29 (Display On) is sent
+		 * after this table. */
 		0xfe, 1, 0, 0, 0x00,
 		0xc4, 1, 0, 0, 0x80,
-		0x35, 0, 0, 10,
-		0x53, 1, 0, 10, 0x20,
-		0x51, 1, 0, 10, 0xff,
-		0x63, 1, 0, 10, 0xff,
-		0x11, 0, 0, 120,
+		0x3a, 1, 0, 0, 0x55,
+		0x35, 1, 0, 0, 0x00,
+		0x53, 1, 0, 0, 0x20,
+		0x51, 1, 0, 0, 0xff,
+		0x63, 1, 0, 0, 0xff,
+		0x11, 0, 0x02, 0x58,
 	};
 	struct device *dev = &p->spi->dev;
 	const u8 *seq = defaults;
@@ -253,7 +279,6 @@ static int co5300fb_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct fb_info *info;
 	struct co5300fb *p;
-	u8 value;
 	int ret;
 
 	info = framebuffer_alloc(sizeof(*p), dev);
@@ -262,8 +287,11 @@ static int co5300fb_probe(struct spi_device *spi)
 	p = info->par;
 	p->spi = spi;
 	spin_lock_init(&p->damage_lock);
-	p->width = p->height = 466;
-	p->xoff = 6;
+	/* Defaults are the C05300AF-51 module on this shield; DT properties
+	 * (chipone,width/height/x-offset/y-offset) override them. */
+	p->width = 410;
+	p->height = 502;
+	p->xoff = 22;
 	device_property_read_u32(dev, "chipone,width", &p->width);
 	device_property_read_u32(dev, "chipone,height", &p->height);
 	device_property_read_u32(dev, "chipone,x-offset", &p->xoff);
@@ -279,7 +307,7 @@ static int co5300fb_probe(struct spi_device *spi)
 	ret = spi_setup(spi);
 	if (ret)
 		goto fail;
-	p->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	p->reset = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
 	if (IS_ERR(p->reset)) {
 		ret = dev_err_probe(dev, PTR_ERR(p->reset), "reset GPIO unavailable\n");
 		goto fail;
@@ -296,6 +324,16 @@ static int co5300fb_probe(struct spi_device *spi)
 		ret = -ENOMEM;
 		goto fail;
 	}
+	/* Sysmem framebuffer: sys_imageblit/sys_fillrect (used by fbcon)
+	 * and fb_sys_write (used by /dev/fb0 writes) draw through
+	 * screen_base, and the core only treats the memory as virtual
+	 * RAM when FBINFO_VIRTFB is set. Without the flag the core
+	 * warns "framebuffer is not in virtual address space" and the
+	 * draw goes nowhere, so the screen stays black even though the
+	 * deferred-I/O row transfers succeed. screen_base and
+	 * screen_buffer point at the same vmalloc memory. */
+	info->screen_base = info->screen_buffer;
+	info->flags = FBINFO_VIRTFB;
 	info->screen_size = info->fix.smem_len;
 	info->var = (struct fb_var_screeninfo) {
 		.xres = p->width, .xres_virtual = p->width,
@@ -314,17 +352,22 @@ static int co5300fb_probe(struct spi_device *spi)
 	if (ret)
 		goto fail;
 
+	/* Reset pulse with RAW (physical) levels: the logical
+	 * gpiod_set_value() path left RST at 0 V on this board (panel
+	 * stuck in reset, init ignored, screen black) even though the
+	 * GPIO is flagged ACTIVE LOW. Raw 0 = physical 0 V = reset
+	 * asserted; raw 1 = physical 3.3 V = reset released. The
+	 * readback below proves the release in dmesg. */
+	ret = gpiod_direction_output_raw(p->reset, 0);
+	if (ret)
+		goto cleanup;
 	usleep_range(10000, 11000);
-	gpiod_set_value_cansleep(p->reset, 0);
+	gpiod_set_raw_value_cansleep(p->reset, 1);
+	dev_info(dev, "reset released, RST raw value=%d (want 1)\n",
+		 gpiod_get_raw_value(p->reset));
 	msleep(150);
-	value = 0;
-	ret = co5300fb_command(p, 0x36, &value, 1);
-	if (ret)
-		goto cleanup;
-	value = 0x55;
-	ret = co5300fb_command(p, 0x3a, &value, 1);
-	if (ret)
-		goto cleanup;
+	/* Init sequence (supplier order, incl. 0x3a=0x55 and the 0x35
+	 * data byte) then Display On. */
 	ret = co5300fb_init_sequence(p);
 	if (ret)
 		goto cleanup;

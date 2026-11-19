@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0+
-/* PCB wiring from the existing shield DTS; geometry from Espressif's
- * CO5300 reference panel. Override geometry/init-sequence for your module.
+/* PCB wiring from the existing shield DTS; geometry and init sequence are
+ * for the C05300AF-51 module on this shield: 410x502, x-offset 22,
+ * supplier init in the supplier's order (FE/C4/3A/35/53/51/63/11, 600 ms
+ * after Sleep Out). 0x35 carries its data byte (0x00); 0x29 (Display On)
+ * is appended by the driver. Do NOT use the Espressif 466x466 reference
+ * values.
  */
 #include "esp32s31_coreboard1.dts"
 
@@ -14,9 +18,14 @@
 		spi-max-frequency = <1000000>;
 		spi-tx-bus-width = <4>;
 		reset-gpios = <&pinctrl 0 GPIO_ACTIVE_LOW>;
-		chipone,width = <466>;
-		chipone,height = <466>;
-		chipone,x-offset = <6>;
+		chipone,width = <410>;
+		chipone,height = <502>;
+		chipone,x-offset = <22>;
 		chipone,y-offset = <0>;
+		/* Record format: [cmd, len, delay-ms BE16, data...] */
+		chipone,init-sequence = [fe 01 00 00 00 c4 01 00 00 80
+					  3a 01 00 00 55 35 01 00 00 00
+					  53 01 00 00 20 51 01 00 00 ff
+					  63 01 00 00 ff 11 00 02 58];
 	};
 };
