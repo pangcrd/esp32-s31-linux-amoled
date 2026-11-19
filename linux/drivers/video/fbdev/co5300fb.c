@@ -42,15 +42,19 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 	{
 		int ret = spi_sync_transfer(p->spi, &t, 1);
 
-		dev_info(&p->spi->dev, "DIAG cmd 0x%02x len %zu -> %d\n",
-			 cmd, len, ret);
+		/* Row commands must not feed printk back into fbcon redraws. */
+		if (cmd != 0x2a && cmd != 0x2b)
+			dev_info(&p->spi->dev,
+				 "DIAG cmd 0x%02x len %zu tx=%*ph -> %d\n",
+				 cmd, len, (int)(4 + len), p->command, ret);
 		return ret;
 	}
 }
 
-/* One independently addressed row per message; never rely on RAMWRC
- * support or on CS surviving between messages. Buffers are kmalloc-backed
- * because the SPI core may DMA-map transfers on other controllers.
+/* CO5300 CASET/RASET require an even start and an even-sized window.
+ * Send two adjacent rows per message; a one-row RASET is invalid.
+ * Never rely on RAMWRC or CS surviving between messages. Use kmalloc-backed
+ * buffers because the SPI core may DMA-map them on other controllers.
  */
 static int co5300fb_row(struct fb_info *info, u32 y)
 {
@@ -61,7 +65,7 @@ static int co5300fb_row(struct fb_info *info, u32 y)
 	u8 address[4];
 	struct spi_transfer t[2] = {
 		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
-		{ .tx_buf = p->pixels, .len = p->width * 2,
+		{ .tx_buf = p->pixels, .len = p->width * 4,
 		  .tx_nbits = SPI_NBITS_QUAD },
 	};
 	u32 x;
@@ -74,12 +78,14 @@ static int co5300fb_row(struct fb_info *info, u32 y)
 	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
 	if (ret)
 		return ret;
-	address[0] = address[2] = row >> 8;
-	address[1] = address[3] = row;
+	address[0] = row >> 8;
+	address[1] = row;
+	address[2] = (row + 1) >> 8;
+	address[3] = row + 1;
 	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
 	if (ret)
 		return ret;
-	for (x = 0; x < p->width; x++) {
+	for (x = 0; x < p->width * 2; x++) {
 		u16 pixel = READ_ONCE(src[x]);
 
 		p->pixels[2 * x] = pixel >> 8;
@@ -97,8 +103,10 @@ static int co5300fb_row(struct fb_info *info, u32 y)
 		rows++;
 		if (rows <= 3 || ret)
 			dev_info(&p->spi->dev,
-				 "DIAG row y=%u xoff=%u -> %d (row #%d)\n",
-				 y, p->xoff, ret, rows);
+				 "DIAG row y=%u xoff=%u RASET=%u..%u bytes=%u lanes=%u/%u -> %d\n",
+				 y, p->xoff, (address[0] << 8) | address[1],
+				 (address[2] << 8) | address[3], t[1].len,
+				 t[0].tx_nbits, t[1].tx_nbits, ret);
 		return ret;
 	}
 }
@@ -160,7 +168,10 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 	last = list_empty(pages) ? p->last : p->height - 1;
 	p->dirty = false;
 	spin_unlock_irqrestore(&p->damage_lock, flags);
-	for (y = first; y <= last; y++) {
+	/* Include the unchanged neighbour when damage covers only one row. */
+	first &= ~1U;
+	last |= 1U;
+	for (y = first; y <= last; y += 2) {
 		ret = co5300fb_row(info, y);
 		if (ret) {
 			dev_err_ratelimited(&p->spi->dev,
@@ -297,7 +308,8 @@ static int co5300fb_probe(struct spi_device *spi)
 	device_property_read_u32(dev, "chipone,x-offset", &p->xoff);
 	device_property_read_u32(dev, "chipone,y-offset", &p->yoff);
 	if (!p->width || !p->height || p->width > 512 || p->height > 512 ||
-	    p->xoff > 65535 - p->width || p->yoff > 65535 - p->height) {
+	    p->xoff > 65535 - p->width || p->yoff > 65535 - p->height ||
+	    ((p->width | p->height | p->xoff | p->yoff) & 1)) {
 		ret = -EINVAL;
 		goto fail;
 	}
@@ -313,7 +325,7 @@ static int co5300fb_probe(struct spi_device *spi)
 		goto fail;
 	}
 	p->command = kmalloc(259, GFP_KERNEL);
-	p->pixels = kmalloc(p->width * 2, GFP_KERNEL);
+	p->pixels = kmalloc(p->width * 4, GFP_KERNEL);
 	info->fix = (struct fb_fix_screeninfo) {
 		.id = "CO5300 QSPI", .type = FB_TYPE_PACKED_PIXELS,
 		.visual = FB_VISUAL_TRUECOLOR, .accel = FB_ACCEL_NONE,
