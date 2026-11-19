@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise the actual CO5300 encoder against datasheet window constraints.
-Run on the build host, not the ESP32 rootfs. This checks descriptors and
-payloads; it does not emulate the ESP32 SPI peripheral or prove wire output.
+"""Compile the actual landscape encoder with a SPI capture stub.
+Host-only test: checks descriptors, windows, rotation and RGB565 bytes.
+It does not emulate the panel or establish on-board performance.
 """
 import argparse
 import os
@@ -11,12 +11,12 @@ import subprocess
 import tempfile
 
 parser = argparse.ArgumentParser()
-parser.add_argument("source", type=Path, help="co5300fb.c to validate")
+parser.add_argument("source", type=Path)
 args = parser.parse_args()
 source = args.source.read_text()
-# Mask comments/strings without shifting offsets while locating C blocks.
 masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
                 lambda m: " " * len(m.group()), source, flags=re.S)
+
 
 def block(marker):
     start = source.index(marker)
@@ -28,7 +28,7 @@ def block(marker):
             return source[start:end + 1] + (";" if marker.startswith("struct ") else "")
     raise ValueError("Unclosed C block")
 
-allocation = re.search(r'p->pixels = kmalloc\([^;]+;', source).group()
+
 header = r"""
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,13 +39,22 @@ header = r"""
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef int spinlock_t;
 struct fb_deferred_io { int unused; };
 struct gpio_desc;
 struct device { int unused; };
 struct spi_device { struct device dev; };
-struct fb_info { void *par; char *screen_buffer; struct { u32 line_length; } fix; };
-struct list_head { bool nonempty; };
+struct fb_info {
+    void *par;
+    char *screen_buffer;
+    struct { u32 line_length, smem_len; } fix;
+};
+struct fb_deferred_io_pageref {
+    unsigned long offset;
+    struct fb_deferred_io_pageref *next;
+};
+struct list_head { struct fb_deferred_io_pageref *first; };
 struct spi_transfer {
     const void *tx_buf;
     unsigned int len;
@@ -60,13 +69,20 @@ struct spi_transfer {
 #define dev_err_ratelimited(...) ((void)0)
 #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
 #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
-#define list_empty(head) (!(head)->nonempty)
+#define list_empty(head) (!(head)->first)
+#define list_for_each_entry(ref, head, member) \
+    for (ref = (head)->first; ref; ref = ref->next)
 #define cond_resched() ((void)0)
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define min_t(type, a, b) min((type)(a), (type)(b))
 #define HZ 100
-#define GFP_KERNEL 0
-#define kmalloc(size, flags) malloc(size)
-static unsigned int spans, phase, current_row;
-static bool seen[502];
+#define PAGE_SIZE 4096
+static u64 ktime_get_ns(void) { static u64 now; return now += 1000; }
+static u64 div_u64(u64 n, u32 d) { return n / d; }
+
+static unsigned int calls, phase, first_want, last_want, width, height;
+static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(2);
@@ -80,104 +96,154 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
     const u8 *b = t[0].tx_buf;
     if (t[0].tx_nbits != 1 || t[0].cs_change)
         fail("header lane width / CS boundary");
+    calls++;
+    if (injected && calls == injected)
+        return -EIO;
     if (phase < 2) {
         if (n != 1 || t[0].len != 8 || b[0] != 2 ||
             b[1] || b[3] || b[2] != (phase ? 0x2b : 0x2a))
             fail("CASET/RASET frame");
         u32 start = ((u32)b[4] << 8) | b[5];
         u32 end = ((u32)b[6] << 8) | b[7];
-        if ((start & 1) || end < start || ((end - start + 1) & 1)) {
-            fprintf(stderr, "Invalid %s: start=%u end=%u extent=%u\n",
-                    phase ? "RASET" : "CASET", start, end, end - start + 1);
-            fail("CO5300 datasheet requires even start and extent");
-        }
+        if ((start & 1) || end < start || ((end - start + 1) & 1))
+            fail("CO5300 requires even start and extent");
         if (!phase) {
-            if (start != 22 || end != 431) fail("column window");
+            if (start != yoff + height - 1 - last_want ||
+                end != yoff + height - 1 - first_want)
+                fail("mirrored partial CASET window");
         } else {
-            if (start > 500 || end != start + 1) fail("two-row window");
-            current_row = start;
+            if (start != xoff || end != xoff + width - 1)
+                fail("native RASET window");
         }
         phase++;
         return 0;
     }
     static const u8 ramwr[] = { 0x32, 0, 0x2c, 0 };
+    u32 rows = last_want - first_want + 1;
     if (n != 2 || t[0].len != 4 || memcmp(b, ramwr, 4) ||
-        t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != 1640)
-        fail("single header + quad RGB565 payload in one message");
+        t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != width * rows * 2)
+        fail("one single header + quad RGB565 payload in one CS assertion");
     b = t[1].tx_buf;
-    for (u32 i = 0; i < 820; i++) {
-        u16 expected = pattern(current_row + i / 410, i % 410);
-        if (b[2*i] != (expected >> 8) || b[2*i+1] != (expected & 255))
-            fail("both rows and big-endian RGB565 payload");
+    /* Independent reference: each logical column, bottom to top. */
+    for (u32 x = 0; x < width; x++) {
+        for (u32 i = 0; i < rows; i++) {
+            u16 expected = pattern(last_want - i, x);
+            u32 off = (x * rows + i) * 2;
+            if (b[off] != (expected >> 8) || b[off+1] != (expected & 255))
+                fail("clockwise rotation / RGB565 wire bytes");
+        }
     }
-    seen[current_row] = true;
-    spans++;
-    phase = 0;
+    phase++;
     return 0;
 }
 """
 stub = r"""
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
                             unsigned long delay) {
-    (void)info; (void)first; (void)last; (void)delay;
-    fail("unexpected retry");
+    (void)info;
+    if (delay != HZ) fail("bounded retry delay");
+    retries++;
+    retry_first = first;
+    retry_last = last;
 }
 """
 main = r"""
-static void clear_capture(void) {
-    spans = phase = 0;
-    memset(seen, 0, sizeof(seen));
+static void capture(u32 first, u32 last) {
+    calls = phase = retries = 0;
+    first_want = first;
+    last_want = last;
+}
+static void run(struct fb_info *info, struct list_head *pages, u32 first, u32 last) {
+    struct co5300fb *p = info->par;
+    p->dirty = true;
+    p->first = first;
+    p->last = last;
+    capture(first & ~1U, (last | 1U) < height ? (last | 1U) : height - 1);
+    co5300fb_deferred_io(info, pages);
+    if (calls != 3 || phase != 3 || retries)
+        fail("one window / two commands / one pixel message");
+}
+static void geometry(u32 w, u32 h) {
+    struct spi_device spi = {0};
+    struct co5300fb p = { .spi = &spi, .width = w, .height = h,
+                         .xoff = 0, .yoff = 22 };
+    width = w; height = h; xoff = p.xoff; yoff = p.yoff;
+    p.command = calloc(259, 1);
+    p.pixels = malloc(w * h * 2);
+    u16 *vmem = malloc(w * h * sizeof(*vmem));
+    if (!p.command || !p.pixels || !vmem) fail("allocation");
+    for (u32 y = 0; y < h; y++)
+        for (u32 x = 0; x < w; x++)
+            vmem[y*w+x] = pattern(y, x);
+    struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
+                           .fix = { .line_length = w*2, .smem_len = w*h*2 } };
+    struct list_head pages = {0};
+    run(&info, &pages, 0, h-1);
+    if (p.stats.full_flushes != 1 || p.stats.bytes != w*h*2 ||
+        p.stats.full_total_us != 2 || p.stats.errors)
+        fail("full-frame stats");
+    for (u32 y = 0; y < h; y++)
+        run(&info, &pages, y, y);
+    for (u32 y = 1; y < h; y += 2)
+        run(&info, &pages, y-1, y);
+    if (h == 410) {
+        run(&info, &pages, 0, 399);
+        run(&info, &pages, 400, 409);
+        struct fb_deferred_io_pageref tail = { .offset = w*h*2 - (w*h*2)%PAGE_SIZE };
+        struct fb_deferred_io_pageref middle = { .offset = 10*PAGE_SIZE, .next = &tail };
+        pages.first = &middle; /* Unsorted offsets plus fbcon damage. */
+        p.dirty = true; p.first = 11; p.last = 11;
+        capture(10, 409);
+        co5300fb_deferred_io(&info, &pages);
+        if (phase != 3) fail("union of mmap and fbcon damage");
+        pages.first = &tail;
+        p.dirty = false;
+        u32 start = ((u32)tail.offset / (w*2)) & ~1U;
+        capture(start, 409);
+        co5300fb_deferred_io(&info, &pages);
+        if (phase != 3) fail("last mmap page padding / clipping");
+        pages.first = NULL;
+    }
+    for (u32 i = 1; i <= 3; i++) {
+        injected = i;
+        p.dirty = true; p.first = 11 < h ? 11 : 1; p.last = p.first;
+        capture(p.first & ~1U, p.last | 1U);
+        co5300fb_deferred_io(&info, &pages);
+        if (calls != i || retries != 1 ||
+            retry_first != first_want || retry_last != last_want ||
+            p.stats.errors != i)
+            fail("transfer failure must retry the complete window");
+    }
+    injected = 0;
+    capture(0, 0); p.dirty = false;
+    co5300fb_deferred_io(&info, &pages);
+    if (calls) fail("idle callback should not flush");
+    p.stopped = true; p.dirty = true;
+    co5300fb_deferred_io(&info, &pages);
+    if (calls) fail("stopped callback should not flush");
+    free(p.command); free(p.pixels); free(vmem);
 }
 int main(void) {
-    struct spi_device spi = {0};
-    struct co5300fb state = { .spi = &spi, .width = 410, .height = 502,
-                              .xoff = 22 };
-    struct co5300fb *p = &state;
-    p->command = calloc(259, 1);
-    ALLOCATION
-    u16 *vmem = calloc(410 * 502, sizeof(*vmem));
-    if (!p->command || !p->pixels || !vmem) fail("allocation");
-    for (u32 y = 0; y < 502; y++)
-        for (u32 x = 0; x < 410; x++)
-            vmem[y * 410 + x] = pattern(y, x);
-    struct fb_info info = { .par = p, .screen_buffer = (char *)vmem,
-                            .fix = { .line_length = 820 } };
-    struct list_head pages = { .nonempty = true };
-    co5300fb_deferred_io(&info, &pages);
-    if (spans != 251 || phase) fail("full-frame coverage");
-    for (u32 y = 0; y < 502; y += 2)
-        if (!seen[y]) fail("missing row pair");
-    pages.nonempty = false;
-    const u32 cases[][4] = {
-        { 11, 11, 10, 1 }, { 501, 501, 500, 1 }, { 31, 32, 30, 2 }
-    };
-    for (u32 i = 0; i < ARRAY_SIZE(cases); i++) {
-        clear_capture();
-        p->dirty = true;
-        p->first = cases[i][0];
-        p->last = cases[i][1];
-        co5300fb_deferred_io(&info, &pages);
-        if (spans != cases[i][3] || !seen[cases[i][2]] || phase)
-            fail("partial damage must include its unchanged neighbouring row");
-    }
-    free(p->command); free(p->pixels); free(vmem);
-    puts("PASS: 251 valid two-row windows, exact 411640-byte RGB565 payload,"
-         " mixed-lane CS continuity, odd/bottom/straddling damage");
+    geometry(502, 410);
+    geometry(2, 2);
+    geometry(512, 512);
+    puts("PASS: landscape/full/partial/mmap windows, exact RGB565 rotation,"
+         " mixed-lane CS, tile edges, failure retry and stats");
     return 0;
 }
 """
 program = "\n".join([
-    header, block("struct co5300fb {"), stub,
+    header, block("struct co5300fb_stats {"), block("struct co5300fb {"), stub,
     block("static int co5300fb_command("),
-    block("static int co5300fb_row("),
-    block("static void co5300fb_deferred_io("),
-    main.replace("ALLOCATION", allocation),
+    block("static void co5300fb_render("),
+    block("static int co5300fb_flush("),
+    block("static void co5300fb_deferred_io("), main,
 ])
 with tempfile.TemporaryDirectory(prefix="co5300-windows-") as temp:
     test = Path(temp) / "test.c"
     exe = Path(temp) / "test"
     test.write_text(program)
-    subprocess.run(["cc", "-std=gnu11", "-O1", "-g",
+    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
                     str(test), "-o", str(exe)], check=True)
     env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")

@@ -35,27 +35,27 @@ properties:
 
   chipone,width:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Visible width in pixels.
+    description: Landscape framebuffer width; maps to native GRAM rows.
     minimum: 1
     maximum: 512
     default: 502
 
   chipone,height:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: Visible height in pixels.
+    description: Landscape framebuffer height; maps to native GRAM columns.
     minimum: 1
     maximum: 512
     default: 410
 
   chipone,x-offset:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: First visible column in controller RAM.
+    description: Offset of logical X in native GRAM rows.
     maximum: 65534
     default: 0
 
   chipone,y-offset:
     $ref: /schemas/types.yaml#/definitions/uint32
-    description: First visible row in controller RAM.
+    description: Offset of reversed logical Y in native GRAM columns.
     maximum: 65534
     default: 22
 
@@ -67,8 +67,9 @@ properties:
       Optional supplier initialization replacing the reference sequence.
       Each record contains command, payload length, delay in milliseconds
       as two bytes (MSB first), and payload. The driver validates record
-      boundaries. MADCTL 0 and COLMOD 0x55 precede this sequence, and
-      Display On (0x29) follows it. Include Sleep Out and its delay.
+      boundaries. Display On (0x29) follows it. Include COLMOD 0x55,
+      Sleep Out and its delay. Landscape rotation is done in software;
+      CO5300 MADCTL does not provide row/column exchange.
       Geometry plus offsets must fit in 16-bit column/row addresses.
 
 required:

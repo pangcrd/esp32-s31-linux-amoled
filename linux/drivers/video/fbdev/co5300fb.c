@@ -7,10 +7,20 @@
 #include <linux/delay.h>
 #include <linux/fb.h>
 #include <linux/gpio/consumer.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/property.h>
+#include <linux/sched.h>
 #include <linux/spi/spi.h>
+#include <linux/timekeeping.h>
 #include <linux/vmalloc.h>
+
+struct co5300fb_stats {
+	u64 flushes, errors, full_flushes;
+	u64 render_us, spi_us, total_us;
+	u64 full_render_us, full_spi_us, full_total_us, max_full_us;
+	u32 first, last, bytes;
+};
 
 struct co5300fb {
 	struct spi_device *spi;
@@ -19,6 +29,7 @@ struct co5300fb {
 	spinlock_t damage_lock;
 	bool dirty, stopped;
 	u32 first, last, width, height, xoff, yoff;
+	struct co5300fb_stats stats; /* Protected by damage_lock. */
 	u32 palette[16];
 	u8 *command, *pixels;
 };
@@ -51,65 +62,133 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 	}
 }
 
-/* CO5300 CASET/RASET require an even start and an even-sized window.
- * Send two adjacent rows per message; a one-row RASET is invalid.
- * Never rely on RAMWRC or CS surviving between messages. Use kmalloc-backed
- * buffers because the SPI core may DMA-map them on other controllers.
+/*
+ * Keep the proven clockwise software rotation:
+ * logical (x, y) -> GRAM (yoff + height - 1 - y, xoff + x).
+ * xoff/yoff describe the unrotated logical axes for the existing DT.
+ * Read 16x16 tiles to avoid a full-height strided source scan. Output is
+ * still row-major GRAM order, RGB565 MSB first, in one even-sized window.
  */
-static int co5300fb_row(struct fb_info *info, u32 y)
+static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
-	const u16 *src = (const u16 *)(info->screen_buffer +
-				     y * info->fix.line_length);
-	u32 xend = p->xoff + p->width - 1, row = y + p->yoff;
+	const u16 *fb = (const u16 *)info->screen_buffer;
+	u32 rows = last - first + 1;
+	u32 xb, yb, x, y;
+
+	for (xb = 0; xb < p->width; xb += 16) {
+		u32 xe = min(xb + 16, p->width);
+
+		for (yb = first; yb <= last; yb += 16) {
+			u32 ye = min(yb + 16, last + 1);
+
+			for (y = yb; y < ye; y++) {
+				const u16 *src = fb + y * p->width + xb;
+				u32 offset = 2 * (xb * rows + last - y);
+
+				for (x = xb; x < xe; x++) {
+					u16 pixel = READ_ONCE(*src++);
+					u8 *dst = p->pixels + offset;
+
+					dst[0] = pixel >> 8;
+					dst[1] = pixel;
+					offset += rows * 2;
+				}
+			}
+		}
+		cond_resched();
+	}
+}
+
+static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
+{
+	struct co5300fb *p = info->par;
+	u32 cfirst = p->yoff + p->height - 1 - last;
+	u32 clast = p->yoff + p->height - 1 - first;
+	u32 rend = p->xoff + p->width - 1;
 	u8 address[4];
 	struct spi_transfer t[2] = {
 		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
-		{ .tx_buf = p->pixels, .len = p->width * 4,
+		{ .tx_buf = p->pixels, .len = p->width * (last - first + 1) * 2,
 		  .tx_nbits = SPI_NBITS_QUAD },
 	};
-	u32 x;
+	u64 begin = ktime_get_ns(), rendered, finish;
+	unsigned long flags;
 	int ret;
 
-	address[0] = p->xoff >> 8;
-	address[1] = p->xoff;
-	address[2] = xend >> 8;
-	address[3] = xend;
+	co5300fb_render(info, first, last);
+	rendered = ktime_get_ns();
+	address[0] = cfirst >> 8;
+	address[1] = cfirst;
+	address[2] = clast >> 8;
+	address[3] = clast;
 	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
 	if (ret)
-		return ret;
-	address[0] = row >> 8;
-	address[1] = row;
-	address[2] = (row + 1) >> 8;
-	address[3] = row + 1;
+		goto done;
+	address[0] = p->xoff >> 8;
+	address[1] = p->xoff;
+	address[2] = rend >> 8;
+	address[3] = rend;
 	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
 	if (ret)
-		return ret;
-	for (x = 0; x < p->width * 2; x++) {
-		u16 pixel = READ_ONCE(src[x]);
-
-		p->pixels[2 * x] = pixel >> 8;
-		p->pixels[2 * x + 1] = pixel;
-	}
+		goto done;
 	p->command[0] = 0x32;
 	p->command[1] = 0;
 	p->command[2] = 0x2c;
 	p->command[3] = 0;
-	/* cs_change remains zero: CS covers the single and quad phases. */
-	{
-		static int rows;
-		int ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
-
-		rows++;
-		if (rows <= 3 || ret)
-			dev_info(&p->spi->dev,
-				 "DIAG row y=%u xoff=%u RASET=%u..%u bytes=%u lanes=%u/%u -> %d\n",
-				 y, p->xoff, (address[0] << 8) | address[1],
-				 (address[2] << 8) | address[3], t[1].len,
-				 t[0].tx_nbits, t[1].tx_nbits, ret);
-		return ret;
+	/* CS stays asserted across the single-lane header and quad payload. */
+	ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
+done:
+	finish = ktime_get_ns();
+	spin_lock_irqsave(&p->damage_lock, flags);
+	p->stats.flushes++;
+	p->stats.errors += !!ret;
+	p->stats.first = first;
+	p->stats.last = last;
+	p->stats.bytes = t[1].len;
+	p->stats.render_us = div_u64(rendered - begin, 1000);
+	p->stats.spi_us = div_u64(finish - rendered, 1000);
+	p->stats.total_us = div_u64(finish - begin, 1000);
+	if (!ret && !first && last == p->height - 1) {
+		p->stats.full_flushes++;
+		p->stats.full_render_us = p->stats.render_us;
+		p->stats.full_spi_us = p->stats.spi_us;
+		p->stats.full_total_us = p->stats.total_us;
+		p->stats.max_full_us = max(p->stats.max_full_us, p->stats.total_us);
 	}
+	spin_unlock_irqrestore(&p->damage_lock, flags);
+	return ret;
 }
+
+/* Reading stats must not printk into fbcon and trigger more display work. */
+static ssize_t flush_stats_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	struct co5300fb_stats stats;
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->damage_lock, flags);
+	stats = p->stats;
+	spin_unlock_irqrestore(&p->damage_lock, flags);
+	return sysfs_emit(buf,
+		"flushes=%llu errors=%llu rows=%u..%u bytes=%u\n"
+		"render_us=%llu spi_us=%llu total_us=%llu\n"
+		"full_flushes=%llu full_render_us=%llu full_spi_us=%llu\n"
+		"full_total_us=%llu max_full_us=%llu\n",
+		stats.flushes, stats.errors, stats.first, stats.last, stats.bytes,
+		stats.render_us, stats.spi_us, stats.total_us,
+		stats.full_flushes, stats.full_render_us, stats.full_spi_us,
+		stats.full_total_us, stats.max_full_us);
+}
+static DEVICE_ATTR_RO(flush_stats);
+
+static struct attribute *co5300fb_attrs[] = {
+	&dev_attr_flush_stats.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(co5300fb);
 
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
 			    unsigned long delay)
@@ -155,8 +234,9 @@ FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(co5300fb,
 static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 {
 	struct co5300fb *p = info->par;
+	struct fb_deferred_io_pageref *ref;
 	unsigned long flags;
-	u32 first, last, y;
+	u32 first, last;
 	int ret;
 
 	spin_lock_irqsave(&p->damage_lock, flags);
@@ -164,22 +244,30 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 		spin_unlock_irqrestore(&p->damage_lock, flags);
 		return;
 	}
-	first = list_empty(pages) ? p->first : 0;
-	last = list_empty(pages) ? p->last : p->height - 1;
+	first = p->dirty ? p->first : p->height;
+	last = p->dirty ? p->last : 0;
 	p->dirty = false;
 	spin_unlock_irqrestore(&p->damage_lock, flags);
-	/* Include the unchanged neighbour when damage covers only one row. */
+	/* mmap damage covers touched pages, not an unconditional full frame. */
+	list_for_each_entry(ref, pages, list) {
+		u32 off = ref->offset, end;
+
+		if (off >= info->fix.smem_len)
+			continue;
+		end = min_t(u32, off + PAGE_SIZE, info->fix.smem_len);
+		first = min(first, off / info->fix.line_length);
+		last = max(last, (end - 1) / info->fix.line_length);
+	}
+	if (first >= p->height)
+		return;
+	/* Include the unchanged neighbour to keep CASET start/extent even. */
 	first &= ~1U;
-	last |= 1U;
-	for (y = first; y <= last; y += 2) {
-		ret = co5300fb_row(info, y);
-		if (ret) {
-			dev_err_ratelimited(&p->spi->dev,
-				"row %u transfer failed: %d\n", y, ret);
-			co5300fb_damage(info, y, last, HZ);
-			return;
-		}
-		cond_resched();
+	last = min(last | 1U, p->height - 1);
+	ret = co5300fb_flush(info, first, last);
+	if (ret) {
+		dev_err_ratelimited(&p->spi->dev,
+				    "rows %u..%u transfer failed: %d\n", first, last, ret);
+		co5300fb_damage(info, first, last, HZ);
 	}
 }
 
@@ -215,7 +303,7 @@ static void co5300fb_destroy(struct fb_info *info)
 	struct co5300fb *p = info->par;
 
 	vfree(info->screen_buffer);
-	kfree(p->pixels);
+	vfree(p->pixels);
 	kfree(p->command);
 	framebuffer_release(info);
 }
@@ -234,19 +322,12 @@ static const struct fb_ops co5300fb_ops = {
 static int co5300fb_init_sequence(struct co5300fb *p)
 {
 	static const u8 defaults[] = {
-		/* Supplier init for the C05300AF-51 410x502 module (proven
-		 * under ESP-IDF), in the supplier's order: FE, C4, 3A, 36,
-		 * 35, 53, 51, 63, 11 (600 ms). 0x35 carries its data byte
-		 * (0x00) — sending it with no data desyncs the panel's
-		 * command parser and the commands after it (53/51/63/11/
-		 * 29) are misread, leaving the display off. 0x36 is MADCTL
-		 * 0x60 (landscape: row/column exchange + column order);
-		 * without it the panel shows portrait. 0x29 (Display On)
-		 * is sent after this table. */
+		/* Keep the proven supplier sequence; rotation is software only.
+		 * Display On (0x29) follows this table.
+		 */
 		0xfe, 1, 0, 0, 0x00,
 		0xc4, 1, 0, 0, 0x80,
 		0x3a, 1, 0, 0, 0x55,
-		0x36, 1, 0, 0, 0x60,
 		0x35, 1, 0, 0, 0x00,
 		0x53, 1, 0, 0, 0x20,
 		0x51, 1, 0, 0, 0xff,
@@ -300,7 +381,7 @@ static int co5300fb_probe(struct spi_device *spi)
 	p->spi = spi;
 	spin_lock_init(&p->damage_lock);
 	/* Defaults are the C05300AF-51 module on this shield, landscape
-	 * (502x410) via MADCTL 0x60; DT properties
+	 * (502x410) via software rotation; DT properties
 	 * (chipone,width/height/x-offset/y-offset) override them. */
 	p->width = 502;
 	p->height = 410;
@@ -328,7 +409,8 @@ static int co5300fb_probe(struct spi_device *spi)
 		goto fail;
 	}
 	p->command = kmalloc(259, GFP_KERNEL);
-	p->pixels = kmalloc(p->width * 4, GFP_KERNEL);
+	/* GPSPI PIO reads this buffer directly; avoid a high-order allocation. */
+	p->pixels = vzalloc(p->width * p->height * 2);
 	info->fix = (struct fb_fix_screeninfo) {
 		.id = "CO5300 QSPI", .type = FB_TYPE_PACKED_PIXELS,
 		.visual = FB_VISUAL_TRUECOLOR, .accel = FB_ACCEL_NONE,
@@ -394,7 +476,7 @@ static int co5300fb_probe(struct spi_device *spi)
 	if (ret)
 		goto cleanup;
 	co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
-	dev_info(dev, "fb%d: %ux%u RGB565 QSPI console at %u Hz\n",
+	dev_info(dev, "fb%d: %ux%u RGB565 QSPI console at %u Hz (tiled single-window)\n",
 		 info->node, p->width, p->height, spi->max_speed_hz);
 	return 0;
 
@@ -440,6 +522,7 @@ static struct spi_driver co5300fb_driver = {
 	.driver = {
 		.name = "co5300fb",
 		.of_match_table = co5300fb_of_match,
+		.dev_groups = co5300fb_groups,
 	},
 	.probe = co5300fb_probe,
 	.remove = co5300fb_remove,

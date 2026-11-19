@@ -70,6 +70,19 @@ if [ -x "$1/sbin/overlay-init" ]; then
 	rm -f "$1/usr/bin/luac"
 fi
 
+# The opt-in AMOLED console needs a persistent, clean login prompt.
+# PID 1 runs the wrapper after rcS; it clears before starting getty, so it
+# never erases an already-printed prompt. Other board configurations keep
+# their existing gettys.
+if sed -n 's/^BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES=//p' "$BR2_CONFIG" |
+	grep -q 'linux-amoled.fragment'; then
+	cp "$BR2_EXTERNAL_ESP32S31_PATH/board/esp32s31/amoled-getty" \
+		"$1/sbin/amoled-getty"
+	chmod 755 "$1/sbin/amoled-getty"
+	sed -i '/^tty0::respawn:/d' "$1/etc/inittab"
+	printf '%s\n' 'tty0::respawn:/sbin/amoled-getty' >> "$1/etc/inittab"
+fi
+
 # A login on each VT in the arguments.  getty, not a shell: Ctrl-C needs a
 # controlling terminal, and cttyhack opens the serial port instead.
 inittab=$1/etc/inittab

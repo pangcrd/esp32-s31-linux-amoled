@@ -1,0 +1,1503 @@
+diff --git a/br2-external/board/esp32s31/amoled-getty b/br2-external/board/esp32s31/amoled-getty
+new file mode 100755
+index 0000000..5bcc074
+--- /dev/null
++++ b/br2-external/board/esp32s31/amoled-getty
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++# PID 1 starts this through inittab. Clear BEFORE getty prints its prompt.
++printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
++exec /sbin/getty -L tty0 115200 vt100
+diff --git a/br2-external/board/esp32s31/post-build.sh b/br2-external/board/esp32s31/post-build.sh
+index 6f6e511..20211a6 100755
+--- a/br2-external/board/esp32s31/post-build.sh
++++ b/br2-external/board/esp32s31/post-build.sh
+@@ -70,6 +70,19 @@ if [ -x "$1/sbin/overlay-init" ]; then
+ 	rm -f "$1/usr/bin/luac"
+ fi
+ 
++# The opt-in AMOLED console needs a persistent, clean login prompt.
++# PID 1 runs the wrapper after rcS; it clears before starting getty, so it
++# never erases an already-printed prompt. Other board configurations keep
++# their existing gettys.
++if sed -n 's/^BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES=//p' "$BR2_CONFIG" |
++	grep -q 'linux-amoled.fragment'; then
++	cp "$BR2_EXTERNAL_ESP32S31_PATH/board/esp32s31/amoled-getty" \
++		"$1/sbin/amoled-getty"
++	chmod 755 "$1/sbin/amoled-getty"
++	sed -i '/^tty0::respawn:/d' "$1/etc/inittab"
++	printf '%s\n' 'tty0::respawn:/sbin/amoled-getty' >> "$1/etc/inittab"
++fi
++
+ # A login on each VT in the arguments.  getty, not a shell: Ctrl-C needs a
+ # controlling terminal, and cttyhack opens the serial port instead.
+ inittab=$1/etc/inittab
+diff --git a/docs/amoled-speed-clean.md b/docs/amoled-speed-clean.md
+new file mode 100644
+index 0000000..23d1e01
+--- /dev/null
++++ b/docs/amoled-speed-clean.md
+@@ -0,0 +1,253 @@
++# CO5300: tăng tốc TX PIO và giữ login prompt sạch
++
++Ngày: 2026-11-19. Cơ sở bản vá: remote main
++d54b23cfe9910d93b1bd837d11d6c438a204bf61.
++
++Trạng thái: bản vá đã qua kiểm tra trên host. Chưa có phép đo trên ESP32-S31
++cho bản vá này; chưa khẳng định full frame dưới 100 ms hoặc hết đường quét.
++
++## Đối chiếu source với log
++
++Đã đọc toàn bộ docs/test_log-2.md, docs/prompt-speed-clean.md, log trước đó
++docs/user_test_log.md và docs/amoled-spi-debug.md. docs/test_log.md không có
++trong checkout hiện tại; test_log-2.md là log cả ngày được người dùng chỉ định.
++
++Log xác nhận firmware đang chạy xoay phần mềm, framebuffer 502x410, 40 MHz,
++một cửa sổ cho mỗi vùng dirty. Tuy nhiên blob co5300fb.c trên remote main là
++95ad38c1ba375e943df663d37581a75f64079d69: vẫn co5300fb_row(), MADCTL 0x60;
++DTS vẫn 20 MHz. Tên commit không phản ánh nội dung các file này. Chưa nhận
++được source chính xác của firmware WSL2 đã chạy thành công.
++
++Vì vậy patch against main phải tái lập phép xoay và single-window được mô tả
++trong log, rồi tối ưu đường SPI. Không dùng MADCTL để đổi trục. Đây là giữ
++kết luận đã chứng minh, không thử lại reset/init/window/hardware.
++
++Ánh xạ dùng trong patch:
++
++    logical (x,y) -> GRAM (22 + 409 - y, x)
++
++Với offsets trong DTS, tổng quát là
++(y-offset + height - 1 - y, x-offset + x).
++Payload duyệt X tăng dần, mỗi cột duyệt Y từ dưới lên; RGB565 MSB trước.
++Full frame: CASET 22..431, RASET 0..501, 411640 byte.
++Dirty rows 0..399: CASET 32..431, RASET 0..501, 401600 byte.
++CASET 22..421 ghi ở log không khớp phép xoay này. Full frame có thể đúng
++nhưng partial update lệch 10 cột, để lại chữ cũ. Patch và test kiểm tra riêng
++cửa sổ partial, không chỉ hình full frame.
++
++## Nút thắt và thay đổi cụ thể
++
++Một full frame có 411640 byte. QSPI bốn lane, 40 MHz:
++
++    411640 * 8 / (4 * 40000000) = 20.582 ms
++    ceil(411640 / 64) = 6432 FIFO transactions
++
++82.3 ms là tính cho một lane. 20.582 ms chỉ là thời gian bits; không gồm
++nạp FIFO, UPDATE, khoảng hở giữa transactions, transpose và scheduling.
++
++spi-esp32s31.c trước patch gọi esp32s31_spi_wait_transaction() mỗi FIFO:
++synchronize_irq, completion, UPDATE poll sleep_us=1, IRQ wait, USR poll
++sleep_us=1. Linux 7.3.4 dùng usleep_range trong polling có sleep khác 0.
++Ở tốc độ này 64 byte quad chỉ mất 3.2 us; chờ IRQ và ngủ có thể lớn hơn
++thời gian bits nhiều lần. Đổi row message thành một message lớn vẫn giữ
++6432 lần gọi wait, nên chưa loại bỏ nút thắt.
++
++Patch:
++
++- TX-only PIO từ 4 MHz trở lên dùng polling không ngủ. Tắt/synchronize IRQ
++  một lần mỗi transfer, không mỗi FIFO.
++- Giữ UPDATE -> RAW.TRANS_DONE -> CMD.USR idle; clear completion trước USR.
++  Không chỉ đọc USR=0 ngay sau khi start, vì bit có thể chưa kịp lên.
++  Timeout thực dựa trên timekeeping; vẫn reset state machine khi timeout.
++- Giữ đường IRQ cho tốc độ thấp/RX, cùng đường DMA/target hiện có.
++  pio_poll cho phép quay lại đường IRQ để so sánh, không rebuild.
++- PIO max_transfer_size từ 4 KiB thành 512 KiB, đủ full frame và geometry
++  tối đa 512x512 RGB565. DMA vẫn 4 KiB bounce buffer; target không DMA vẫn
++  64 byte. PIO RX cũng nhận giới hạn lớn hơn, nhưng không đổi thuật toán RX.
++- Copy từng word 4 byte với kích thước cố định; tail ngắn được zero-pad.
++  cond_resched mỗi khoảng 4 KiB; không giữ CPU/IRQ toàn cục suốt một frame.
++- Framebuffer vẫn cùng driver/deferred-I/O, gom dirty rows thành một window.
++  Xoay theo tiles 16x16 để đọc source gần nhau trong cache.
++  Căn vùng dirty gồm hàng lân cận để start và extent của CASET đều chẵn.
++- mmap chỉ gom các trang được chạm vào, hợp với damage fbcon; không ép mọi
++  lần mmap thành full frame.
++- Buffer pixels dùng vzalloc, tránh allocation vật lý liên tục cỡ 412 KiB.
++  GPSPI PIO truy cập trực tiếp buffer; controller không có can_dma, nên
++  __spi_map_msg trong SPI core không DMA-map buffer này.
++- Giữ framing: CASET/RASET và tham số một lane; 32 00 2c 00 một lane,
++  pixels bốn lane, cùng message/CS. Giữ reset raw, supplier init, delays
++  150 ms/600 ms và framebuffer RAM đã chứng minh.
++- Bỏ DIAG per-row; thêm flush_stats sysfs, đọc không printk và không redraw.
++  Timing chứa thời gian scheduling trong flush, không chứa delay gom dirty
++  của deferred I/O (khoảng 40 ms).
++
++Chưa port GDMA: chưa có số liệu chứng minh sau khi bỏ IRQ/sleep thì DMA
++vẫn bắt buộc. DMA không thay phép xoay phần mềm. Nếu full_spi_us vẫn vượt
++ngân sách, số liệu này sẽ định hướng bước tiếp theo thay vì đoán.
++Do panel quét độc lập và PIO vẫn có 6432 transaction, dưới 100 ms cũng
++không tự chứng minh hết tearing/đường quét; cần xác nhận quan sát trên board.
++
++## Login prompt sạch và tồn tại sau reboot
++
++Đây là thay đổi rootfs, không thể chỉ flash kernel. post-build.sh nhận biết
++linux-amoled.fragment, cài /sbin/amoled-getty, thay tty0 getty bằng:
++
++    tty0::respawn:/sbin/amoled-getty
++
++Wrapper xoá màn hình trước khi exec getty. PID 1 vẫn khởi chạy/respawn getty,
++giữ cách khởi chạy đã hoạt động; serial getty vẫn như cấu hình đang dùng.
++Wrapper chạy lại mỗi lần logout/respawn, nên prompt mới luôn được in sau
++clear. Không clear sau khi getty đã in prompt.
++
++Kernel messages xuất hiện muộn sau khi getty chạy vẫn có thể ghi lên tty0;
++patch không thay console routing/loglevel. Phép kiểm tra reboot bên dưới cần
++xác nhận màn hình sạch trong boot thực tế, không chỉ thứ tự script.
++
++## Kiểm tra đã chạy
++
++- Compile hai object với Linux 7.3.4 thực tế, W=1: PASS, không cảnh báo.
++  Đây là compile-test trên host x86_64; chưa build toàn bộ image RISC-V.
++- DTS qua C preprocessor và dtc của cùng tree: PASS, không cảnh báo.
++- checkpatch --strict cho diff hai driver: 0 errors, 0 warnings, 0 checks.
++- check-co5300-windows.py compile code thật với ASan/UBSan: PASS; kiểm tra
++  full/partial/odd/bottom/mmap, tile edges 2x2/502x410/512x512, từng byte RGB565,
++  mixed-lane CS, retry cả window và stats.
++- check-esp32s31-pio.py compile các hàm thật với fake MMIO, ASan/UBSan: PASS;
++  single/quad, aligned/unaligned/tail/full 411640 byte, clear stale RAW,
++  UPDATE -> RAW -> USR, timeout/reset, synchronize_irq một lần, legacy/DMA/
++  target selection và limits.
++- Wrapper/post-build: shell syntax, chạy lặp hai lần, profile AMOLED và
++  headless, đúng một tty0 line, clear trước prompt: PASS.
++- git apply --check rồi git apply thật trong clone mới của main: PASS.
++  git diff --check và hai test host chạy trên source đã apply: PASS.
++
++Fake MMIO chỉ kiểm tra logic phần mềm; không chứng minh timing của silicon
++hoặc tốc độ panel. Board test không cần Python, pkill hay SPI reads.
++
++## WSL2: lấy patch, build và flash theo thứ tự
++
++Các lệnh dưới dùng checkout sạch ở ~/s31-linux, output AMOLED riêng và
++bootloader artifacts đã dùng trong lần flash thành công trước đó.
++Nếu source WSL2 đang có sửa đổi chưa commit, lưu chúng trước khi đổi branch;
++patch dưới được kiểm tra against main nêu trên.
++
++    cd ~/s31-linux
++    git fetch origin
++    git switch -c test/co5300-speed-clean origin/main
++    curl --fail --location \
++      https://raw.githubusercontent.com/pangcrd/esp32-s31-linux-amoled/fix/co5300-speed-clean/patches/co5300-speed-clean.patch \
++      -o /tmp/co5300-speed-clean.patch
++    git apply --check /tmp/co5300-speed-clean.patch
++    git apply /tmp/co5300-speed-clean.patch
++
++    git submodule update --init --recursive
++    python3 scripts/check-co5300-windows.py linux/drivers/video/fbdev/co5300fb.c
++    python3 scripts/check-esp32s31-pio.py linux/drivers/spi/spi-esp32s31.c
++
++    export ESP32S31_VERSION="$(make -s version)"
++    BR_OUT="$PWD/build/br-output-coreboard1-amoled"
++    if [ ! -f "$BR_OUT/.config" ]; then
++      make -C external/buildroot O="$BR_OUT" \
++        BR2_EXTERNAL="$PWD/br2-external" coreboard1_defconfig
++    fi
++    sh scripts/enable-amoled.sh "$BR_OUT"
++    make -C external/buildroot O="$BR_OUT" BR2_EXTERNAL="$PWD/br2-external"
++
++    sh scripts/copy-images.sh "$BR_OUT/images" build/coreboard1 \
++      bootloader/partitions-coreboard1.csv
++    make -s flash-args BOARD=coreboard1 > build/coreboard1/flash-args.txt
++    source ~/esp/esp-idf/export.sh
++    python -m esptool --chip esp32s31 merge-bin \
++      -o build/coreboard1/flash.bin @build/coreboard1/flash-args.txt
++
++    FLASH_PORT=/dev/ttyACM0
++    python -m esptool --chip esp32s31 --port "$FLASH_PORT" --baud 921600 \
++      write-flash 0x0 build/coreboard1/flash.bin
++
++Đặt FLASH_PORT thành port flash đang dùng. scripts/enable-amoled.sh chạy
++olddefconfig và linux-dirclean; kernel được extract/copy overlay lại.
++Không dùng scripts/ci-build.sh hoặc áp lại coreboard1_defconfig sau khi
++enable AMOLED, vì sẽ làm mất fragment opt-in.
++
++Nếu lấy branch fix/co5300-speed-clean trực tiếp thì source đã có patch;
++không chạy git apply lần nữa. Lệnh build/flash từ export ESP32S31_VERSION
++trở xuống giống hệt.
++
++## USB rootfs đang dùng: cập nhật nhỏ, giữ dữ liệu USB
++
++Build mới đã cài wrapper vào rootfs.ext2/sdcard.img, được copy vào
++build/coreboard1/buildroot/. Nếu cài USB image mới bằng cách đang dùng thì
++không cần chỉnh tay.
++
++Với USB hiện tại, có thể cập nhật đúng hai file này qua serial shell trên
++board, rồi sync/reboot; thay đổi nằm trên rootfs USB nên tồn tại sau reboot.
++Không cần ghi lại cả USB:
++
++    cat > /sbin/amoled-getty <<'EOF'
++    #!/bin/sh
++    printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
++    exec /sbin/getty -L tty0 115200 vt100
++    EOF
++    chmod 755 /sbin/amoled-getty
++    sed -i '/^tty0::respawn:/d' /etc/inittab
++    printf '%s\n' 'tty0::respawn:/sbin/amoled-getty' >> /etc/inittab
++    sync
++    reboot
++
++Đừng chạy clear riêng sau reboot: wrapper đảm nhiệm clear trước prompt.
++
++## Board: xác minh và đo full frame
++
++Chạy từ serial hoặc SSH, không từ login VT trên panel:
++
++    dmesg | grep -E 'co5300|UPDATE timeout|TRANS_DONE timeout|USR timeout'
++    cat /sys/class/graphics/fb0/virtual_size
++    grep '^tty0::respawn:' /etc/inittab
++    cat /sys/module/spi_esp32s31/parameters/pio_poll
++    cat /sys/bus/spi/devices/*/flush_stats
++
++Kỳ vọng: virtual_size 502,410; probe có "(tiled single-window)" và 40000000 Hz;
++tty0 gọi /sbin/amoled-getty; pio_poll=Y; không timeout; errors=0.
++Sau reboot, log kernel hiển thị theo hướng đã xác nhận, rồi màn hình được
++xoá và còn login prompt mới; prompt không biến mất do clear sau getty.
++
++Để có 5 mẫu full frame giữ nguyên ảnh/prompt, từ WSL2 chép test script sang
++board theo địa chỉ IP hiện tại (log trước dùng 192.168.0.182):
++
++    scp scripts/test-amoled-speed.sh root@192.168.0.182:/tmp/test-amoled-speed.sh
++
++Sau đó ở serial/SSH trên board:
++
++    sh /tmp/test-amoled-speed.sh
++
++Script snapshot RAM của /dev/fb0, rồi ghi lại đúng 411640 byte năm lần.
++Không đọc panel qua SPI. Nó giữ ảnh prompt thay vì đổ zero rồi làm mất prompt.
++Có 1 s giữa các mẫu và xoá file snapshot khi kết thúc.
++
++Đọc full_render_us/full_spi_us/full_total_us cho full frame gần nhất,
++không dùng total_us của cursor/partial update. full_flushes phải tăng qua
++các mẫu, errors giữ 0. Đích full_total_us < 100000, càng thấp càng tốt;
++max_full_us có thể gồm một frame lúc boot bị scheduler trì hoãn.
++
++Nếu cần A/B với đường IRQ cũ, chỉ đổi module parameter:
++
++    printf 'N\n' > /sys/module/spi_esp32s31/parameters/pio_poll
++    sh /tmp/test-amoled-speed.sh
++    printf 'Y\n' > /sys/module/spi_esp32s31/parameters/pio_poll
++
++Đường N có thể chậm hơn nhiều. Nó vẫn giữ rotation/window/rootfs mới;
++A/B chỉ cô lập tác động của TX polling. Sau reboot mặc định là Y.
++Nếu bản Y có timeout, giữ log timeout và stats; N là fallback phần mềm.
++
++Gửi lại output 5 mẫu Y và mô tả panel có còn quét chậm/chữ cũ không.
++full_spi_us lớn -> còn chi phí PIO/refill/scheduling; full_render_us lớn ->
++còn chi phí transpose/cache; lỗi partial/clean prompt cần đối chiếu vùng dirty
++và thời điểm getty. Không cần thêm phép đo điện hay thử đọc SPI.
++
++## Cấu hình panel khác
++
++Giữ mục này cho bước sau, đúng thứ tự ưu tiên yêu cầu. GPIO, compatible,
++frequency và init-sequence hiện đã ở DTS. Built-in DTB cần rebuild/flash
++khi sửa DTS. Rotation software và QSPI framing của CO5300 không thể áp
++nguyên sang ST7789/ILI9341; cơ chế cấu hình nhiều panel cần được thiết kế
++sau khi số liệu speed và prompt trên board xác nhận hai việc hiện tại.
+diff --git a/linux/Documentation/ABI/testing/sysfs-driver-co5300fb b/linux/Documentation/ABI/testing/sysfs-driver-co5300fb
+new file mode 100644
+index 0000000..290856f
+--- /dev/null
++++ b/linux/Documentation/ABI/testing/sysfs-driver-co5300fb
+@@ -0,0 +1,21 @@
++What:		/sys/bus/spi/devices/.../flush_stats
++Date:		November 2026
++Contact:	ESP32-S31 Linux maintainers
++Description:
++		Read-only CO5300 framebuffer flush statistics. Output consists of
++		newline-separated key=value fields in four lines.
++
++		flushes counts attempted dirty-range flushes; errors counts failed
++		flushes. rows gives the last logical first..last row range and bytes
++		is the requested pixel payload, including unchanged alignment rows.
++
++		render_us is tiled software rotation time; spi_us includes CASET,
++		RASET and the synchronous single-header/quad-pixel message, including
++		controller/software wait time; total_us spans both. Times include
++		scheduling within the operation, but exclude the deferred-I/O delay.
++
++		full_flushes counts successful full-frame updates. full_render_us,
++		full_spi_us and full_total_us retain the latest successful full-frame
++		sample even after a partial/cursor update. max_full_us is the maximum
++		successful full-frame total since probe. Counters are per device and
++		reset at probe. Reading this file neither logs nor flushes.
+diff --git a/linux/Documentation/devicetree/bindings/display/chipone,co5300.yaml b/linux/Documentation/devicetree/bindings/display/chipone,co5300.yaml
+index fcda393..28acd6e 100644
+--- a/linux/Documentation/devicetree/bindings/display/chipone,co5300.yaml
++++ b/linux/Documentation/devicetree/bindings/display/chipone,co5300.yaml
+@@ -35,27 +35,27 @@ properties:
+ 
+   chipone,width:
+     $ref: /schemas/types.yaml#/definitions/uint32
+-    description: Visible width in pixels.
++    description: Landscape framebuffer width; maps to native GRAM rows.
+     minimum: 1
+     maximum: 512
+     default: 502
+ 
+   chipone,height:
+     $ref: /schemas/types.yaml#/definitions/uint32
+-    description: Visible height in pixels.
++    description: Landscape framebuffer height; maps to native GRAM columns.
+     minimum: 1
+     maximum: 512
+     default: 410
+ 
+   chipone,x-offset:
+     $ref: /schemas/types.yaml#/definitions/uint32
+-    description: First visible column in controller RAM.
++    description: Offset of logical X in native GRAM rows.
+     maximum: 65534
+     default: 0
+ 
+   chipone,y-offset:
+     $ref: /schemas/types.yaml#/definitions/uint32
+-    description: First visible row in controller RAM.
++    description: Offset of reversed logical Y in native GRAM columns.
+     maximum: 65534
+     default: 22
+ 
+@@ -67,8 +67,9 @@ properties:
+       Optional supplier initialization replacing the reference sequence.
+       Each record contains command, payload length, delay in milliseconds
+       as two bytes (MSB first), and payload. The driver validates record
+-      boundaries. MADCTL 0 and COLMOD 0x55 precede this sequence, and
+-      Display On (0x29) follows it. Include Sleep Out and its delay.
++      boundaries. Display On (0x29) follows it. Include COLMOD 0x55,
++      Sleep Out and its delay. Landscape rotation is done in software;
++      CO5300 MADCTL does not provide row/column exchange.
+       Geometry plus offsets must fit in 16-bit column/row addresses.
+ 
+ required:
+diff --git a/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts b/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
+index 0ed1388..e080aab 100644
+--- a/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
++++ b/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
+@@ -1,14 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0+
+-/* PCB wiring from the existing shield DTS; geometry and init sequence are
+- * for the C05300AF-51 module on this shield, rotated to landscape
+- * (502x410) via MADCTL 0x60 (row/column exchange + column order):
+- * logical width 502 maps to the native 502 rows (x-offset 0), logical
+- * height 410 maps to native columns 22..431 (y-offset 22). Supplier
+- * init in the supplier's order (FE/C4/3A/36/35/53/51/63/11, 600 ms
+- * after Sleep Out). 0x35 carries its data byte (0x00); 0x29 (Display On)
+- * is appended by the driver. Do NOT use the Espressif 466x466 reference
+- * values. SPI runs at 20 MHz (the panel's proven ESP-IDF rate); 1 MHz
+- * was too slow to keep up with the boot log.
++/* C05300AF-51: native 410x502, landscape framebuffer 502x410.
++ * Software rotation maps logical X to GRAM rows 0..501 and logical Y
++ * (reversed) to GRAM columns 22..431. MADCTL cannot exchange axes.
++ * Keep the supplier sequence and the working 40 MHz from the test log.
+  */
+ #include "esp32s31_coreboard1.dts"
+ 
+@@ -19,7 +13,7 @@
+ 	panel@0 {
+ 		compatible = "chipone,co5300";
+ 		reg = <0>;
+-		spi-max-frequency = <20000000>;
++		spi-max-frequency = <40000000>;
+ 		spi-tx-bus-width = <4>;
+ 		reset-gpios = <&pinctrl 0 GPIO_ACTIVE_LOW>;
+ 		chipone,width = <502>;
+@@ -28,7 +22,7 @@
+ 		chipone,y-offset = <22>;
+ 		/* Record format: [cmd, len, delay-ms BE16, data...] */
+ 		chipone,init-sequence = [fe 01 00 00 00 c4 01 00 00 80
+-					  3a 01 00 00 55 36 01 00 00 60
++					  3a 01 00 00 55
+ 					  35 01 00 00 00 53 01 00 00 20
+ 					  51 01 00 00 ff 63 01 00 00 ff
+ 					  11 00 02 58];
+diff --git a/linux/drivers/spi/spi-esp32s31.c b/linux/drivers/spi/spi-esp32s31.c
+index 71ad8e2..6adfe13 100644
+--- a/linux/drivers/spi/spi-esp32s31.c
++++ b/linux/drivers/spi/spi-esp32s31.c
+@@ -20,9 +20,15 @@
+ #include <linux/platform_device.h>
+ #include <linux/pinctrl/pinconf-generic.h>
+ #include <linux/reset.h>
++#include <linux/sched.h>
+ #include <linux/spi/spi.h>
+ 
+ #define S31_SPI_FIFO_SIZE	64
++
++/* Short high-speed FIFO transactions complete sooner than an IRQ round trip. */
++static bool pio_poll = true;
++module_param(pio_poll, bool, 0644);
++MODULE_PARM_DESC(pio_poll, "Poll high-speed TX-only PIO FIFO transactions");
+ #define S31_SPI_CMD		0x00
+ #define S31_SPI_CMD_UPDATE	BIT(23)
+ #define S31_SPI_CMD_USR		BIT(24)
+@@ -152,7 +158,10 @@ static size_t esp32s31_spi_max_transfer_size(struct spi_device *spi)
+ {
+ 	struct esp32s31_spi *s = spi_controller_get_devdata(spi->controller);
+ 
+-	return s->target && !s->rx_dma ? S31_SPI_FIFO_SIZE : SZ_4K;
++	if (s->target && !s->rx_dma)
++		return S31_SPI_FIFO_SIZE;
++	/* DMA bounce buffers are 4 KiB; PIO can stream a whole framebuffer. */
++	return s->tx_dma ? SZ_4K : SZ_512K;
+ }
+ 
+ static void esp32s31_spi_target_reset(struct esp32s31_spi *s)
+@@ -461,6 +470,32 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
+ 	return 0;
+ }
+ 
++/* Called only after the TX-only PIO path has disabled and synchronized IRQs.
++ * Do not sleep or initialize a completion for each 64-byte FIFO refill.
++ * Use the timekeeping-based poll with sleep_us=0 for a real bounded timeout.
++ */
++static int esp32s31_spi_poll_transaction(struct esp32s31_spi *s)
++{
++	u32 val;
++
++	writel(~0U, s->base + S31_SPI_INT_CLR);
++	writel(S31_SPI_CMD_UPDATE, s->base + S31_SPI_CMD);
++	if (readl_poll_timeout(s->base + S31_SPI_CMD, val,
++			       !(val & S31_SPI_CMD_UPDATE), 0, 1000))
++		return esp32s31_spi_transaction_error(s, "UPDATE");
++
++	writel(S31_SPI_CMD_USR, s->base + S31_SPI_CMD);
++	/* RAW avoids the race where USR has not risen on the first read yet. */
++	if (readl_poll_timeout(s->base + S31_SPI_INT_RAW, val,
++			       val & S31_SPI_TRANS_DONE, 0, 2000))
++		return esp32s31_spi_transaction_error(s, "TRANS_DONE");
++	if (readl_poll_timeout(s->base + S31_SPI_CMD, val,
++			       !(val & S31_SPI_CMD_USR), 0, 1000))
++		return esp32s31_spi_transaction_error(s, "USR");
++	writel(S31_SPI_TRANS_DONE, s->base + S31_SPI_INT_CLR);
++	return 0;
++}
++
+ static void esp32s31_spi_dma_complete(void *data)
+ {
+ 	complete(data);
+@@ -669,8 +704,9 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
+ 	u32 ctrl, user, misc;
+ 	u32 cs = spi_get_chipselect(spi, 0);
+ 	bool gpio_cs = spi_get_csgpiod(spi, 0);
++	bool poll;
+ 	u32 word;
+-	unsigned int i, count, offset;
++	unsigned int i, count, offset, timeout_ms;
+ 	int ret;
+ 
+ 	if (s->target)
+@@ -757,6 +793,13 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
+ 	    xfer->tx_buf && xfer->rx_buf)
+ 		return esp32s31_spi_dma_duplex_transfer(s, ctlr, xfer, misc);
+ 
++	poll = READ_ONCE(pio_poll) && xfer->tx_buf && !xfer->rx_buf &&
++		xfer->effective_speed_hz >= 4000000;
++	if (poll) {
++		writel(0, s->base + S31_SPI_INT_ENA);
++		synchronize_irq(s->irq);
++	}
++	timeout_ms = poll ? 0 : spi_controller_xfer_timeout(ctlr, xfer);
+ 	for (offset = 0; offset < xfer->len; offset += S31_SPI_FIFO_SIZE) {
+ 		unsigned int chunk = min_t(unsigned int, S31_SPI_FIFO_SIZE,
+ 					       xfer->len - offset);
+@@ -777,19 +820,26 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
+ 		if (xfer->tx_buf) {
+ 			const u8 *tx = xfer->tx_buf;
+ 
+-			for (i = 0; i < chunk; i += 4) {
++			/* Constant-size copies avoid a variable-length memcpy per word. */
++			for (i = 0; i + sizeof(word) <= chunk; i += sizeof(word)) {
++				memcpy(&word, tx + offset + i, sizeof(word));
++				writel(word, s->base + S31_SPI_W0 + i);
++			}
++			if (i < chunk) {
+ 				word = 0;
+-				count = min_t(unsigned int, 4, chunk - i);
+-				memcpy(&word, tx + offset + i, count);
++				memcpy(&word, tx + offset + i, chunk - i);
+ 				writel(word, s->base + S31_SPI_W0 + i);
+ 			}
+ 		}
+ 
+-		ret = esp32s31_spi_wait_transaction(s,
+-				spi_controller_xfer_timeout(ctlr, xfer));
++		ret = poll ? esp32s31_spi_poll_transaction(s) :
++			esp32s31_spi_wait_transaction(s, timeout_ms);
+ 		if (ret)
+ 			return ret;
+ 
++		/* Keep the CPU schedulable while a large GPIO-CS message is open. */
++		if (poll && !((offset + S31_SPI_FIFO_SIZE) & (SZ_4K - 1)))
++			cond_resched();
+ 		if (xfer->rx_buf) {
+ 			u8 *rx = xfer->rx_buf;
+ 
+diff --git a/linux/drivers/video/fbdev/co5300fb.c b/linux/drivers/video/fbdev/co5300fb.c
+index 95ad38c..f45b218 100644
+--- a/linux/drivers/video/fbdev/co5300fb.c
++++ b/linux/drivers/video/fbdev/co5300fb.c
+@@ -7,11 +7,21 @@
+ #include <linux/delay.h>
+ #include <linux/fb.h>
+ #include <linux/gpio/consumer.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/property.h>
++#include <linux/sched.h>
+ #include <linux/spi/spi.h>
++#include <linux/timekeeping.h>
+ #include <linux/vmalloc.h>
+ 
++struct co5300fb_stats {
++	u64 flushes, errors, full_flushes;
++	u64 render_us, spi_us, total_us;
++	u64 full_render_us, full_spi_us, full_total_us, max_full_us;
++	u32 first, last, bytes;
++};
++
+ struct co5300fb {
+ 	struct spi_device *spi;
+ 	struct gpio_desc *reset;
+@@ -19,6 +29,7 @@ struct co5300fb {
+ 	spinlock_t damage_lock;
+ 	bool dirty, stopped;
+ 	u32 first, last, width, height, xoff, yoff;
++	struct co5300fb_stats stats; /* Protected by damage_lock. */
+ 	u32 palette[16];
+ 	u8 *command, *pixels;
+ };
+@@ -51,65 +62,133 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
+ 	}
+ }
+ 
+-/* CO5300 CASET/RASET require an even start and an even-sized window.
+- * Send two adjacent rows per message; a one-row RASET is invalid.
+- * Never rely on RAMWRC or CS surviving between messages. Use kmalloc-backed
+- * buffers because the SPI core may DMA-map them on other controllers.
++/*
++ * Keep the proven clockwise software rotation:
++ * logical (x, y) -> GRAM (yoff + height - 1 - y, xoff + x).
++ * xoff/yoff describe the unrotated logical axes for the existing DT.
++ * Read 16x16 tiles to avoid a full-height strided source scan. Output is
++ * still row-major GRAM order, RGB565 MSB first, in one even-sized window.
+  */
+-static int co5300fb_row(struct fb_info *info, u32 y)
++static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
+ {
+ 	struct co5300fb *p = info->par;
+-	const u16 *src = (const u16 *)(info->screen_buffer +
+-				     y * info->fix.line_length);
+-	u32 xend = p->xoff + p->width - 1, row = y + p->yoff;
++	const u16 *fb = (const u16 *)info->screen_buffer;
++	u32 rows = last - first + 1;
++	u32 xb, yb, x, y;
++
++	for (xb = 0; xb < p->width; xb += 16) {
++		u32 xe = min(xb + 16, p->width);
++
++		for (yb = first; yb <= last; yb += 16) {
++			u32 ye = min(yb + 16, last + 1);
++
++			for (y = yb; y < ye; y++) {
++				const u16 *src = fb + y * p->width + xb;
++				u32 offset = 2 * (xb * rows + last - y);
++
++				for (x = xb; x < xe; x++) {
++					u16 pixel = READ_ONCE(*src++);
++					u8 *dst = p->pixels + offset;
++
++					dst[0] = pixel >> 8;
++					dst[1] = pixel;
++					offset += rows * 2;
++				}
++			}
++		}
++		cond_resched();
++	}
++}
++
++static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
++{
++	struct co5300fb *p = info->par;
++	u32 cfirst = p->yoff + p->height - 1 - last;
++	u32 clast = p->yoff + p->height - 1 - first;
++	u32 rend = p->xoff + p->width - 1;
+ 	u8 address[4];
+ 	struct spi_transfer t[2] = {
+ 		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
+-		{ .tx_buf = p->pixels, .len = p->width * 4,
++		{ .tx_buf = p->pixels, .len = p->width * (last - first + 1) * 2,
+ 		  .tx_nbits = SPI_NBITS_QUAD },
+ 	};
+-	u32 x;
++	u64 begin = ktime_get_ns(), rendered, finish;
++	unsigned long flags;
+ 	int ret;
+ 
+-	address[0] = p->xoff >> 8;
+-	address[1] = p->xoff;
+-	address[2] = xend >> 8;
+-	address[3] = xend;
++	co5300fb_render(info, first, last);
++	rendered = ktime_get_ns();
++	address[0] = cfirst >> 8;
++	address[1] = cfirst;
++	address[2] = clast >> 8;
++	address[3] = clast;
+ 	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
+ 	if (ret)
+-		return ret;
+-	address[0] = row >> 8;
+-	address[1] = row;
+-	address[2] = (row + 1) >> 8;
+-	address[3] = row + 1;
++		goto done;
++	address[0] = p->xoff >> 8;
++	address[1] = p->xoff;
++	address[2] = rend >> 8;
++	address[3] = rend;
+ 	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
+ 	if (ret)
+-		return ret;
+-	for (x = 0; x < p->width * 2; x++) {
+-		u16 pixel = READ_ONCE(src[x]);
+-
+-		p->pixels[2 * x] = pixel >> 8;
+-		p->pixels[2 * x + 1] = pixel;
+-	}
++		goto done;
+ 	p->command[0] = 0x32;
+ 	p->command[1] = 0;
+ 	p->command[2] = 0x2c;
+ 	p->command[3] = 0;
+-	/* cs_change remains zero: CS covers the single and quad phases. */
+-	{
+-		static int rows;
+-		int ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
+-
+-		rows++;
+-		if (rows <= 3 || ret)
+-			dev_info(&p->spi->dev,
+-				 "DIAG row y=%u xoff=%u RASET=%u..%u bytes=%u lanes=%u/%u -> %d\n",
+-				 y, p->xoff, (address[0] << 8) | address[1],
+-				 (address[2] << 8) | address[3], t[1].len,
+-				 t[0].tx_nbits, t[1].tx_nbits, ret);
+-		return ret;
++	/* CS stays asserted across the single-lane header and quad payload. */
++	ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
++done:
++	finish = ktime_get_ns();
++	spin_lock_irqsave(&p->damage_lock, flags);
++	p->stats.flushes++;
++	p->stats.errors += !!ret;
++	p->stats.first = first;
++	p->stats.last = last;
++	p->stats.bytes = t[1].len;
++	p->stats.render_us = div_u64(rendered - begin, 1000);
++	p->stats.spi_us = div_u64(finish - rendered, 1000);
++	p->stats.total_us = div_u64(finish - begin, 1000);
++	if (!ret && !first && last == p->height - 1) {
++		p->stats.full_flushes++;
++		p->stats.full_render_us = p->stats.render_us;
++		p->stats.full_spi_us = p->stats.spi_us;
++		p->stats.full_total_us = p->stats.total_us;
++		p->stats.max_full_us = max(p->stats.max_full_us, p->stats.total_us);
+ 	}
++	spin_unlock_irqrestore(&p->damage_lock, flags);
++	return ret;
++}
++
++/* Reading stats must not printk into fbcon and trigger more display work. */
++static ssize_t flush_stats_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
++	struct co5300fb *p = info->par;
++	struct co5300fb_stats stats;
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->damage_lock, flags);
++	stats = p->stats;
++	spin_unlock_irqrestore(&p->damage_lock, flags);
++	return sysfs_emit(buf,
++		"flushes=%llu errors=%llu rows=%u..%u bytes=%u\n"
++		"render_us=%llu spi_us=%llu total_us=%llu\n"
++		"full_flushes=%llu full_render_us=%llu full_spi_us=%llu\n"
++		"full_total_us=%llu max_full_us=%llu\n",
++		stats.flushes, stats.errors, stats.first, stats.last, stats.bytes,
++		stats.render_us, stats.spi_us, stats.total_us,
++		stats.full_flushes, stats.full_render_us, stats.full_spi_us,
++		stats.full_total_us, stats.max_full_us);
+ }
++static DEVICE_ATTR_RO(flush_stats);
++
++static struct attribute *co5300fb_attrs[] = {
++	&dev_attr_flush_stats.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(co5300fb);
+ 
+ static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
+ 			    unsigned long delay)
+@@ -155,8 +234,9 @@ FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(co5300fb,
+ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
+ {
+ 	struct co5300fb *p = info->par;
++	struct fb_deferred_io_pageref *ref;
+ 	unsigned long flags;
+-	u32 first, last, y;
++	u32 first, last;
+ 	int ret;
+ 
+ 	spin_lock_irqsave(&p->damage_lock, flags);
+@@ -164,22 +244,30 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
+ 		spin_unlock_irqrestore(&p->damage_lock, flags);
+ 		return;
+ 	}
+-	first = list_empty(pages) ? p->first : 0;
+-	last = list_empty(pages) ? p->last : p->height - 1;
++	first = p->dirty ? p->first : p->height;
++	last = p->dirty ? p->last : 0;
+ 	p->dirty = false;
+ 	spin_unlock_irqrestore(&p->damage_lock, flags);
+-	/* Include the unchanged neighbour when damage covers only one row. */
++	/* mmap damage covers touched pages, not an unconditional full frame. */
++	list_for_each_entry(ref, pages, list) {
++		u32 off = ref->offset, end;
++
++		if (off >= info->fix.smem_len)
++			continue;
++		end = min_t(u32, off + PAGE_SIZE, info->fix.smem_len);
++		first = min(first, off / info->fix.line_length);
++		last = max(last, (end - 1) / info->fix.line_length);
++	}
++	if (first >= p->height)
++		return;
++	/* Include the unchanged neighbour to keep CASET start/extent even. */
+ 	first &= ~1U;
+-	last |= 1U;
+-	for (y = first; y <= last; y += 2) {
+-		ret = co5300fb_row(info, y);
+-		if (ret) {
+-			dev_err_ratelimited(&p->spi->dev,
+-				"row %u transfer failed: %d\n", y, ret);
+-			co5300fb_damage(info, y, last, HZ);
+-			return;
+-		}
+-		cond_resched();
++	last = min(last | 1U, p->height - 1);
++	ret = co5300fb_flush(info, first, last);
++	if (ret) {
++		dev_err_ratelimited(&p->spi->dev,
++				    "rows %u..%u transfer failed: %d\n", first, last, ret);
++		co5300fb_damage(info, first, last, HZ);
+ 	}
+ }
+ 
+@@ -215,7 +303,7 @@ static void co5300fb_destroy(struct fb_info *info)
+ 	struct co5300fb *p = info->par;
+ 
+ 	vfree(info->screen_buffer);
+-	kfree(p->pixels);
++	vfree(p->pixels);
+ 	kfree(p->command);
+ 	framebuffer_release(info);
+ }
+@@ -234,19 +322,12 @@ static const struct fb_ops co5300fb_ops = {
+ static int co5300fb_init_sequence(struct co5300fb *p)
+ {
+ 	static const u8 defaults[] = {
+-		/* Supplier init for the C05300AF-51 410x502 module (proven
+-		 * under ESP-IDF), in the supplier's order: FE, C4, 3A, 36,
+-		 * 35, 53, 51, 63, 11 (600 ms). 0x35 carries its data byte
+-		 * (0x00) — sending it with no data desyncs the panel's
+-		 * command parser and the commands after it (53/51/63/11/
+-		 * 29) are misread, leaving the display off. 0x36 is MADCTL
+-		 * 0x60 (landscape: row/column exchange + column order);
+-		 * without it the panel shows portrait. 0x29 (Display On)
+-		 * is sent after this table. */
++		/* Keep the proven supplier sequence; rotation is software only.
++		 * Display On (0x29) follows this table.
++		 */
+ 		0xfe, 1, 0, 0, 0x00,
+ 		0xc4, 1, 0, 0, 0x80,
+ 		0x3a, 1, 0, 0, 0x55,
+-		0x36, 1, 0, 0, 0x60,
+ 		0x35, 1, 0, 0, 0x00,
+ 		0x53, 1, 0, 0, 0x20,
+ 		0x51, 1, 0, 0, 0xff,
+@@ -300,7 +381,7 @@ static int co5300fb_probe(struct spi_device *spi)
+ 	p->spi = spi;
+ 	spin_lock_init(&p->damage_lock);
+ 	/* Defaults are the C05300AF-51 module on this shield, landscape
+-	 * (502x410) via MADCTL 0x60; DT properties
++	 * (502x410) via software rotation; DT properties
+ 	 * (chipone,width/height/x-offset/y-offset) override them. */
+ 	p->width = 502;
+ 	p->height = 410;
+@@ -328,7 +409,8 @@ static int co5300fb_probe(struct spi_device *spi)
+ 		goto fail;
+ 	}
+ 	p->command = kmalloc(259, GFP_KERNEL);
+-	p->pixels = kmalloc(p->width * 4, GFP_KERNEL);
++	/* GPSPI PIO reads this buffer directly; avoid a high-order allocation. */
++	p->pixels = vzalloc(p->width * p->height * 2);
+ 	info->fix = (struct fb_fix_screeninfo) {
+ 		.id = "CO5300 QSPI", .type = FB_TYPE_PACKED_PIXELS,
+ 		.visual = FB_VISUAL_TRUECOLOR, .accel = FB_ACCEL_NONE,
+@@ -394,7 +476,7 @@ static int co5300fb_probe(struct spi_device *spi)
+ 	if (ret)
+ 		goto cleanup;
+ 	co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+-	dev_info(dev, "fb%d: %ux%u RGB565 QSPI console at %u Hz\n",
++	dev_info(dev, "fb%d: %ux%u RGB565 QSPI console at %u Hz (tiled single-window)\n",
+ 		 info->node, p->width, p->height, spi->max_speed_hz);
+ 	return 0;
+ 
+@@ -440,6 +522,7 @@ static struct spi_driver co5300fb_driver = {
+ 	.driver = {
+ 		.name = "co5300fb",
+ 		.of_match_table = co5300fb_of_match,
++		.dev_groups = co5300fb_groups,
+ 	},
+ 	.probe = co5300fb_probe,
+ 	.remove = co5300fb_remove,
+diff --git a/scripts/check-co5300-windows.py b/scripts/check-co5300-windows.py
+index 7994f78..629afb7 100755
+--- a/scripts/check-co5300-windows.py
++++ b/scripts/check-co5300-windows.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+-"""Exercise the actual CO5300 encoder against datasheet window constraints.
+-Run on the build host, not the ESP32 rootfs. This checks descriptors and
+-payloads; it does not emulate the ESP32 SPI peripheral or prove wire output.
++"""Compile the actual landscape encoder with a SPI capture stub.
++Host-only test: checks descriptors, windows, rotation and RGB565 bytes.
++It does not emulate the panel or establish on-board performance.
+ """
+ import argparse
+ import os
+@@ -11,13 +11,13 @@ import subprocess
+ import tempfile
+ 
+ parser = argparse.ArgumentParser()
+-parser.add_argument("source", type=Path, help="co5300fb.c to validate")
++parser.add_argument("source", type=Path)
+ args = parser.parse_args()
+ source = args.source.read_text()
+-# Mask comments/strings without shifting offsets while locating C blocks.
+ masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
+                 lambda m: " " * len(m.group()), source, flags=re.S)
+ 
++
+ def block(marker):
+     start = source.index(marker)
+     opening = masked.index("{", start)
+@@ -28,7 +28,7 @@ def block(marker):
+             return source[start:end + 1] + (";" if marker.startswith("struct ") else "")
+     raise ValueError("Unclosed C block")
+ 
+-allocation = re.search(r'p->pixels = kmalloc\([^;]+;', source).group()
++
+ header = r"""
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -39,13 +39,22 @@ header = r"""
+ typedef uint8_t u8;
+ typedef uint16_t u16;
+ typedef uint32_t u32;
++typedef uint64_t u64;
+ typedef int spinlock_t;
+ struct fb_deferred_io { int unused; };
+ struct gpio_desc;
+ struct device { int unused; };
+ struct spi_device { struct device dev; };
+-struct fb_info { void *par; char *screen_buffer; struct { u32 line_length; } fix; };
+-struct list_head { bool nonempty; };
++struct fb_info {
++    void *par;
++    char *screen_buffer;
++    struct { u32 line_length, smem_len; } fix;
++};
++struct fb_deferred_io_pageref {
++    unsigned long offset;
++    struct fb_deferred_io_pageref *next;
++};
++struct list_head { struct fb_deferred_io_pageref *first; };
+ struct spi_transfer {
+     const void *tx_buf;
+     unsigned int len;
+@@ -60,13 +69,20 @@ struct spi_transfer {
+ #define dev_err_ratelimited(...) ((void)0)
+ #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
+ #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
+-#define list_empty(head) (!(head)->nonempty)
++#define list_empty(head) (!(head)->first)
++#define list_for_each_entry(ref, head, member) \
++    for (ref = (head)->first; ref; ref = ref->next)
+ #define cond_resched() ((void)0)
++#define min(a, b) ((a) < (b) ? (a) : (b))
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define min_t(type, a, b) min((type)(a), (type)(b))
+ #define HZ 100
+-#define GFP_KERNEL 0
+-#define kmalloc(size, flags) malloc(size)
+-static unsigned int spans, phase, current_row;
+-static bool seen[502];
++#define PAGE_SIZE 4096
++static u64 ktime_get_ns(void) { static u64 now; return now += 1000; }
++static u64 div_u64(u64 n, u32 d) { return n / d; }
++
++static unsigned int calls, phase, first_want, last_want, width, height;
++static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
+ static void fail(const char *message) {
+     fprintf(stderr, "FAIL: %s\n", message);
+     exit(2);
+@@ -80,104 +96,154 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
+     const u8 *b = t[0].tx_buf;
+     if (t[0].tx_nbits != 1 || t[0].cs_change)
+         fail("header lane width / CS boundary");
++    calls++;
++    if (injected && calls == injected)
++        return -EIO;
+     if (phase < 2) {
+         if (n != 1 || t[0].len != 8 || b[0] != 2 ||
+             b[1] || b[3] || b[2] != (phase ? 0x2b : 0x2a))
+             fail("CASET/RASET frame");
+         u32 start = ((u32)b[4] << 8) | b[5];
+         u32 end = ((u32)b[6] << 8) | b[7];
+-        if ((start & 1) || end < start || ((end - start + 1) & 1)) {
+-            fprintf(stderr, "Invalid %s: start=%u end=%u extent=%u\n",
+-                    phase ? "RASET" : "CASET", start, end, end - start + 1);
+-            fail("CO5300 datasheet requires even start and extent");
+-        }
++        if ((start & 1) || end < start || ((end - start + 1) & 1))
++            fail("CO5300 requires even start and extent");
+         if (!phase) {
+-            if (start != 22 || end != 431) fail("column window");
++            if (start != yoff + height - 1 - last_want ||
++                end != yoff + height - 1 - first_want)
++                fail("mirrored partial CASET window");
+         } else {
+-            if (start > 500 || end != start + 1) fail("two-row window");
+-            current_row = start;
++            if (start != xoff || end != xoff + width - 1)
++                fail("native RASET window");
+         }
+         phase++;
+         return 0;
+     }
+     static const u8 ramwr[] = { 0x32, 0, 0x2c, 0 };
++    u32 rows = last_want - first_want + 1;
+     if (n != 2 || t[0].len != 4 || memcmp(b, ramwr, 4) ||
+-        t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != 1640)
+-        fail("single header + quad RGB565 payload in one message");
++        t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != width * rows * 2)
++        fail("one single header + quad RGB565 payload in one CS assertion");
+     b = t[1].tx_buf;
+-    for (u32 i = 0; i < 820; i++) {
+-        u16 expected = pattern(current_row + i / 410, i % 410);
+-        if (b[2*i] != (expected >> 8) || b[2*i+1] != (expected & 255))
+-            fail("both rows and big-endian RGB565 payload");
++    /* Independent reference: each logical column, bottom to top. */
++    for (u32 x = 0; x < width; x++) {
++        for (u32 i = 0; i < rows; i++) {
++            u16 expected = pattern(last_want - i, x);
++            u32 off = (x * rows + i) * 2;
++            if (b[off] != (expected >> 8) || b[off+1] != (expected & 255))
++                fail("clockwise rotation / RGB565 wire bytes");
++        }
+     }
+-    seen[current_row] = true;
+-    spans++;
+-    phase = 0;
++    phase++;
+     return 0;
+ }
+ """
+ stub = r"""
+ static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
+                             unsigned long delay) {
+-    (void)info; (void)first; (void)last; (void)delay;
+-    fail("unexpected retry");
++    (void)info;
++    if (delay != HZ) fail("bounded retry delay");
++    retries++;
++    retry_first = first;
++    retry_last = last;
+ }
+ """
+ main = r"""
+-static void clear_capture(void) {
+-    spans = phase = 0;
+-    memset(seen, 0, sizeof(seen));
++static void capture(u32 first, u32 last) {
++    calls = phase = retries = 0;
++    first_want = first;
++    last_want = last;
+ }
+-int main(void) {
++static void run(struct fb_info *info, struct list_head *pages, u32 first, u32 last) {
++    struct co5300fb *p = info->par;
++    p->dirty = true;
++    p->first = first;
++    p->last = last;
++    capture(first & ~1U, (last | 1U) < height ? (last | 1U) : height - 1);
++    co5300fb_deferred_io(info, pages);
++    if (calls != 3 || phase != 3 || retries)
++        fail("one window / two commands / one pixel message");
++}
++static void geometry(u32 w, u32 h) {
+     struct spi_device spi = {0};
+-    struct co5300fb state = { .spi = &spi, .width = 410, .height = 502,
+-                              .xoff = 22 };
+-    struct co5300fb *p = &state;
+-    p->command = calloc(259, 1);
+-    ALLOCATION
+-    u16 *vmem = calloc(410 * 502, sizeof(*vmem));
+-    if (!p->command || !p->pixels || !vmem) fail("allocation");
+-    for (u32 y = 0; y < 502; y++)
+-        for (u32 x = 0; x < 410; x++)
+-            vmem[y * 410 + x] = pattern(y, x);
+-    struct fb_info info = { .par = p, .screen_buffer = (char *)vmem,
+-                            .fix = { .line_length = 820 } };
+-    struct list_head pages = { .nonempty = true };
+-    co5300fb_deferred_io(&info, &pages);
+-    if (spans != 251 || phase) fail("full-frame coverage");
+-    for (u32 y = 0; y < 502; y += 2)
+-        if (!seen[y]) fail("missing row pair");
+-    pages.nonempty = false;
+-    const u32 cases[][4] = {
+-        { 11, 11, 10, 1 }, { 501, 501, 500, 1 }, { 31, 32, 30, 2 }
+-    };
+-    for (u32 i = 0; i < ARRAY_SIZE(cases); i++) {
+-        clear_capture();
+-        p->dirty = true;
+-        p->first = cases[i][0];
+-        p->last = cases[i][1];
++    struct co5300fb p = { .spi = &spi, .width = w, .height = h,
++                         .xoff = 0, .yoff = 22 };
++    width = w; height = h; xoff = p.xoff; yoff = p.yoff;
++    p.command = calloc(259, 1);
++    p.pixels = malloc(w * h * 2);
++    u16 *vmem = malloc(w * h * sizeof(*vmem));
++    if (!p.command || !p.pixels || !vmem) fail("allocation");
++    for (u32 y = 0; y < h; y++)
++        for (u32 x = 0; x < w; x++)
++            vmem[y*w+x] = pattern(y, x);
++    struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
++                           .fix = { .line_length = w*2, .smem_len = w*h*2 } };
++    struct list_head pages = {0};
++    run(&info, &pages, 0, h-1);
++    if (p.stats.full_flushes != 1 || p.stats.bytes != w*h*2 ||
++        p.stats.full_total_us != 2 || p.stats.errors)
++        fail("full-frame stats");
++    for (u32 y = 0; y < h; y++)
++        run(&info, &pages, y, y);
++    for (u32 y = 1; y < h; y += 2)
++        run(&info, &pages, y-1, y);
++    if (h == 410) {
++        run(&info, &pages, 0, 399);
++        run(&info, &pages, 400, 409);
++        struct fb_deferred_io_pageref tail = { .offset = w*h*2 - (w*h*2)%PAGE_SIZE };
++        struct fb_deferred_io_pageref middle = { .offset = 10*PAGE_SIZE, .next = &tail };
++        pages.first = &middle; /* Unsorted offsets plus fbcon damage. */
++        p.dirty = true; p.first = 11; p.last = 11;
++        capture(10, 409);
++        co5300fb_deferred_io(&info, &pages);
++        if (phase != 3) fail("union of mmap and fbcon damage");
++        pages.first = &tail;
++        p.dirty = false;
++        u32 start = ((u32)tail.offset / (w*2)) & ~1U;
++        capture(start, 409);
++        co5300fb_deferred_io(&info, &pages);
++        if (phase != 3) fail("last mmap page padding / clipping");
++        pages.first = NULL;
++    }
++    for (u32 i = 1; i <= 3; i++) {
++        injected = i;
++        p.dirty = true; p.first = 11 < h ? 11 : 1; p.last = p.first;
++        capture(p.first & ~1U, p.last | 1U);
+         co5300fb_deferred_io(&info, &pages);
+-        if (spans != cases[i][3] || !seen[cases[i][2]] || phase)
+-            fail("partial damage must include its unchanged neighbouring row");
++        if (calls != i || retries != 1 ||
++            retry_first != first_want || retry_last != last_want ||
++            p.stats.errors != i)
++            fail("transfer failure must retry the complete window");
+     }
+-    free(p->command); free(p->pixels); free(vmem);
+-    puts("PASS: 251 valid two-row windows, exact 411640-byte RGB565 payload,"
+-         " mixed-lane CS continuity, odd/bottom/straddling damage");
++    injected = 0;
++    capture(0, 0); p.dirty = false;
++    co5300fb_deferred_io(&info, &pages);
++    if (calls) fail("idle callback should not flush");
++    p.stopped = true; p.dirty = true;
++    co5300fb_deferred_io(&info, &pages);
++    if (calls) fail("stopped callback should not flush");
++    free(p.command); free(p.pixels); free(vmem);
++}
++int main(void) {
++    geometry(502, 410);
++    geometry(2, 2);
++    geometry(512, 512);
++    puts("PASS: landscape/full/partial/mmap windows, exact RGB565 rotation,"
++         " mixed-lane CS, tile edges, failure retry and stats");
+     return 0;
+ }
+ """
+ program = "\n".join([
+-    header, block("struct co5300fb {"), stub,
++    header, block("struct co5300fb_stats {"), block("struct co5300fb {"), stub,
+     block("static int co5300fb_command("),
+-    block("static int co5300fb_row("),
+-    block("static void co5300fb_deferred_io("),
+-    main.replace("ALLOCATION", allocation),
++    block("static void co5300fb_render("),
++    block("static int co5300fb_flush("),
++    block("static void co5300fb_deferred_io("), main,
+ ])
+ with tempfile.TemporaryDirectory(prefix="co5300-windows-") as temp:
+     test = Path(temp) / "test.c"
+     exe = Path(temp) / "test"
+     test.write_text(program)
+-    subprocess.run(["cc", "-std=gnu11", "-O1", "-g",
++    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
+                     "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                     str(test), "-o", str(exe)], check=True)
+     env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
+diff --git a/scripts/check-esp32s31-pio.py b/scripts/check-esp32s31-pio.py
+new file mode 100644
+index 0000000..a45624a
+--- /dev/null
++++ b/scripts/check-esp32s31-pio.py
+@@ -0,0 +1,298 @@
++#!/usr/bin/env python3
++"""Exercise the actual PIO transfer functions with bounded fake MMIO.
++Host-only; validates FIFO bytes, control sequencing and path selection.
++Real controller latency and panel behaviour still require the board test.
++"""
++import argparse
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser()
++parser.add_argument("source", type=Path)
++args = parser.parse_args()
++source = args.source.read_text()
++masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
++                lambda m: " " * len(m.group()), source, flags=re.S)
++
++
++def block(marker):
++    start = source.index(marker)
++    opening = masked.index("{", start)
++    depth = 0
++    for end in range(opening, len(masked)):
++        depth += (masked[end] == "{") - (masked[end] == "}")
++        if depth == 0:
++            return source[start:end + 1] + (";" if marker.startswith("struct ") else "")
++    raise ValueError("Unclosed C block")
++
++
++defines = "\n".join(line for line in source.splitlines()
++                    if line.startswith("#define S31_SPI_"))
++header = r"""
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef uintptr_t dma_addr_t;
++#define __iomem
++#define BIT(n) (1U << (n))
++#define GENMASK(h, l) ((~0U >> (31-(h))) & (~0U << (l)))
++#define FIELD_PREP(mask, val) (((val) << __builtin_ctz(mask)) & (mask))
++#define DIV_ROUND_UP(a,b) (((a)+(b)-1)/(b))
++#define clamp_t(type,v,l,h) ((v)<(l)?(l):((v)>(h)?(h):(v)))
++#define min_t(type,a,b) ((type)(a)<(type)(b)?(type)(a):(type)(b))
++#define max_t(type,a,b) ((type)(a)>(type)(b)?(type)(a):(type)(b))
++#define SZ_4K 4096
++#define SZ_512K 524288
++#define READ_ONCE(x) (x)
++#define SPI_CPOL BIT(0)
++#define SPI_CPHA BIT(1)
++#define SPI_CS_HIGH BIT(2)
++#define SPI_LSB_FIRST BIT(3)
++struct completion { int unused; };
++struct dma_chan { int unused; };
++struct device { int unused; };
++struct clk { int unused; };
++struct spi_controller {
++    void *data;
++    unsigned int num_chipselect;
++};
++struct spi_device {
++    struct spi_controller *controller;
++    u32 mode, max_speed_hz;
++    bool gpio_cs;
++};
++struct spi_transfer {
++    const void *tx_buf;
++    void *rx_buf;
++    unsigned int len, speed_hz, effective_speed_hz;
++    unsigned int tx_nbits, rx_nbits;
++    bool cs_change, last;
++};
++static void *spi_controller_get_devdata(struct spi_controller *c) { return c->data; }
++static u32 spi_get_chipselect(struct spi_device *spi, unsigned int n) {
++    (void)spi; (void)n; return 0;
++}
++static bool spi_get_csgpiod(struct spi_device *spi, unsigned int n) {
++    (void)n; return spi->gpio_cs;
++}
++static bool spi_transfer_is_last(struct spi_controller *c, struct spi_transfer *t) {
++    (void)c; return t->last;
++}
++static u32 clk_get_rate(struct clk *clk) { (void)clk; return 80000000; }
++static unsigned int spi_controller_xfer_timeout(struct spi_controller *c,
++                                                 struct spi_transfer *t) {
++    (void)c; (void)t; return 200;
++}
++static bool pio_poll = true;
++static unsigned int syncs, chunks, legacy, rescheds, target_calls, dma_calls;
++static unsigned int fail_stage, error_calls, stage, ticks, wanted_lanes;
++static unsigned int soft_resets;
++static bool error_mode;
++static u32 regs[64];
++static const u8 *expected;
++static size_t expected_len, emitted;
++static void fail(const char *s) { fprintf(stderr, "FAIL: %s\n", s); exit(2); }
++#define dev_err_ratelimited(...) (error_calls++, error_mode = true)
++static void synchronize_irq(int irq) { (void)irq; syncs++; }
++static void cond_resched(void) { rescheds++; }
++static u32 readl(void *address);
++static void writel(u32 value, void *address);
++/* Bounded emulated poll, with explicit verification that sleep_us stays zero. */
++#define readl_poll_timeout(addr, val, condition, sleep_us, timeout_us) \
++    ({ int rc = -ETIMEDOUT; \
++       if ((sleep_us) != 0 || !(timeout_us)) fail("poll must have a real deadline and no sleep"); \
++       for (unsigned int attempt=0; attempt<16; attempt++) { \
++           (val)=readl(addr); if (condition) { rc=0; break; } \
++       } rc; })
++"""
++mmio = r"""
++static void emit(void) {
++    unsigned int len = (regs[S31_SPI_MS_DLEN/4] + 1)/8;
++    if (len > 64 || emitted + len > expected_len) fail("FIFO length");
++    const u8 *fifo = (const u8 *)&regs[S31_SPI_W0/4];
++    if (expected && memcmp(fifo, expected + emitted, len))
++        fail("FIFO byte order / tail / unaligned source");
++    if (wanted_lanes &&
++        !!(regs[S31_SPI_USER/4] & S31_SPI_FWRITE_QUAD) != (wanted_lanes == 4))
++        fail("single / quad lane configuration");
++    if (len % 4) {
++        for (unsigned int i=len; i<(len+3)/4*4; i++)
++            if (fifo[i]) fail("short FIFO tail must be zero-padded");
++    }
++    emitted += len;
++    chunks++;
++}
++static u32 readl(void *address) {
++    unsigned int off = (u8 *)address - (u8 *)regs;
++    if (off == S31_SPI_CMD && stage == 1 && fail_stage != 1) {
++        regs[off/4] &= ~S31_SPI_CMD_UPDATE;
++        stage = 0;
++    }
++    if (off == S31_SPI_INT_RAW && stage == 2 && fail_stage != 2 && ++ticks >= 2) {
++        emit();
++        regs[off/4] |= S31_SPI_TRANS_DONE;
++        stage = 3;
++    }
++    if (off == S31_SPI_CMD && stage == 2 && !error_mode)
++        fail("USR must not be polled idle before RAW completion");
++    if (off == S31_SPI_CMD && stage == 3 && fail_stage != 3 && ++ticks >= 4) {
++        regs[off/4] &= ~S31_SPI_CMD_USR;
++        stage = 0;
++    }
++    return regs[off/4];
++}
++static void writel(u32 value, void *address) {
++    unsigned int off = (u8 *)address - (u8 *)regs;
++    if (off == S31_SPI_INT_CLR) {
++        regs[S31_SPI_INT_RAW/4] &= ~value;
++        return;
++    }
++    if (off == S31_SPI_SLAVE && (value & S31_SPI_SOFT_RESET)) {
++        regs[S31_SPI_CMD/4] = 0;
++        stage = 0;
++        soft_resets++;
++    }
++    if (off == S31_SPI_CMD) {
++        if (value == S31_SPI_CMD_UPDATE) {
++            if (regs[off/4] & S31_SPI_CMD_USR)
++                fail("UPDATE before previous shifter idle");
++            stage = 1;
++        } else if (value == S31_SPI_CMD_USR) {
++            if (stage || (regs[S31_SPI_INT_RAW/4] & S31_SPI_TRANS_DONE))
++                fail("USR before UPDATE idle / stale completion");
++            stage = 2; ticks = 0;
++        }
++    }
++    regs[off/4] = value;
++}
++"""
++stub = r"""
++static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
++                                        unsigned int timeout) {
++    (void)s; (void)timeout;
++    legacy++;
++    emit();
++    return 0;
++}
++static int esp32s31_spi_target_transfer(struct spi_controller *c,
++                                        struct spi_device *s, struct spi_transfer *t) {
++    (void)c; (void)s; (void)t; target_calls++; return 0;
++}
++static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s, struct spi_controller *c,
++                                    struct spi_transfer *t, u32 misc) {
++    (void)s; (void)c; (void)t; (void)misc; dma_calls++; return 0;
++}
++static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s, struct spi_controller *c,
++                                          struct spi_transfer *t, u32 misc) {
++    return esp32s31_spi_dma_transfer(s, c, t, misc);
++}
++"""
++main = r"""
++static void reset_capture(const u8 *bytes, unsigned int len) {
++    memset(regs, 0, sizeof(regs));
++    /* Simulate a stale RAW completion: fast path must clear it. */
++    regs[S31_SPI_INT_RAW/4] = S31_SPI_TRANS_DONE;
++    syncs = chunks = legacy = rescheds = stage = ticks = 0;
++    error_calls = soft_resets = emitted = target_calls = dma_calls = 0;
++    expected = bytes; expected_len = len; error_mode = false;
++}
++int main(void) {
++    struct esp32s31_spi state = { .base = regs, .max_data_lines = 4, .irq = 1 };
++    struct spi_controller ctlr = { .data = &state, .num_chipselect = 3 };
++    struct spi_device spi = { .controller = &ctlr, .max_speed_hz = 40000000, .gpio_cs = true };
++    u8 *storage = malloc(411640 + 8), *rx = malloc(128);
++    if (!storage || !rx) fail("allocation");
++    for (unsigned int i=0; i<411640+8; i++) storage[i] = (u8)(i*73 + i/13);
++    struct spi_transfer t = { .tx_buf = storage, .len = 4, .tx_nbits = 1, .last = true };
++    const unsigned int lengths[] = {1,2,3,4,15,16,31,63,64,65,127,128,4095,4096,4097,411640};
++    for (unsigned int lane=1; lane<=4; lane+=3) {
++        wanted_lanes = lane;
++        t.tx_nbits = lane;
++        for (unsigned int align=0; align<4; align++) {
++            t.tx_buf = storage + align;
++            for (unsigned int n=0; n<sizeof(lengths)/sizeof(lengths[0]); n++) {
++                t.len = lengths[n];
++                reset_capture(t.tx_buf,t.len);
++                if (esp32s31_spi_transfer_one(&ctlr,&spi,&t)) fail("fast TX return");
++                if (emitted != t.len || chunks != (t.len+63)/64 ||
++                    syncs != 1 || legacy || error_calls ||
++                    rescheds != ((t.len+63)/64)/64 ||
++                    (regs[S31_SPI_CMD/4] & S31_SPI_CMD_USR) ||
++                    (regs[S31_SPI_INT_RAW/4] & S31_SPI_TRANS_DONE))
++                    fail("fast FIFO completion / transfer-wide IRQ sync / reschedule");
++            }
++        }
++    }
++    /* Recovery from UPDATE, TRANS_DONE or USR stalls uses the actual reset helper. */
++    for (fail_stage=1; fail_stage<=3; fail_stage++) {
++        t.len=64; reset_capture(t.tx_buf,t.len);
++        if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) != -ETIMEDOUT ||
++            error_calls != 1 || soft_resets != 1 || stage ||
++            regs[S31_SPI_CMD/4] || regs[S31_SPI_INT_RAW/4])
++            fail("timeout recovery");
++    }
++    fail_stage=0;
++    t.len=64;
++    t.speed_hz=1000000; reset_capture(t.tx_buf,t.len);
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || legacy!=1 || syncs)
++        fail("low-speed legacy path");
++    t.speed_hz=40000000; pio_poll=false; reset_capture(t.tx_buf,t.len);
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || legacy!=1)
++        fail("runtime fallback");
++    pio_poll=true; t.rx_buf=rx; t.tx_nbits=1; t.rx_nbits=1; wanted_lanes=1;
++    reset_capture(t.tx_buf,t.len);
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || legacy!=1)
++        fail("full duplex stays on legacy path");
++    t.tx_buf=NULL; wanted_lanes=0; reset_capture(NULL,t.len);
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || legacy!=1)
++        fail("RX stays on legacy path");
++    if (esp32s31_spi_max_transfer_size(&spi)!=SZ_512K)
++        fail("PIO framebuffer transfer limit");
++    state.target=true;
++    if (esp32s31_spi_max_transfer_size(&spi)!=64) fail("target FIFO limit");
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || target_calls!=1)
++        fail("target path");
++    state.target=false; state.tx_dma=state.rx_dma=(struct dma_chan *)1;
++    if (esp32s31_spi_max_transfer_size(&spi)!=SZ_4K) fail("DMA bounce buffer limit");
++    t.tx_buf=storage; t.rx_buf=NULL; t.len=128; reset_capture(storage,t.len);
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || dma_calls!=1 || syncs)
++        fail("DMA path preserved");
++    state.tx_dma=state.rx_dma=NULL;
++    t.len=SZ_512K+1;
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t)!=-EMSGSIZE)
++        fail("oversize transfer rejection");
++    t.len=64; t.tx_nbits=4; t.rx_buf=rx; t.rx_nbits=1;
++    if (esp32s31_spi_transfer_one(&ctlr,&spi,&t)!=-EINVAL)
++        fail("quad full duplex rejected");
++    free(storage); free(rx);
++    puts("PASS: exact full-frame/aligned/unaligned/tail FIFO bytes; single/quad;"
++         " UPDATE -> RAW -> USR; timeout reset; IRQ sync once; legacy/DMA/target limits");
++    return 0;
++}
++"""
++program = "\n".join([
++    header, defines, block("struct esp32s31_spi {"), mmio, stub,
++    block("static u32 esp32s31_spi_set_clock("),
++    block("static size_t esp32s31_spi_max_transfer_size("),
++    block("static void esp32s31_spi_target_reset("),
++    block("static int esp32s31_spi_transaction_error("),
++    block("static int esp32s31_spi_poll_transaction("),
++    block("static int esp32s31_spi_transfer_one("), main,
++])
++with tempfile.TemporaryDirectory(prefix="esp32s31-pio-") as temp:
++    test = Path(temp) / "test.c"
++    exe = Path(temp) / "test"
++    test.write_text(program)
++    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
++                    "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                    str(test), "-o", str(exe)], check=True)
++    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
++    raise SystemExit(subprocess.run([str(exe)], env=env).returncode)
+diff --git a/scripts/test-amoled-speed.sh b/scripts/test-amoled-speed.sh
+new file mode 100755
+index 0000000..926cdc1
+--- /dev/null
++++ b/scripts/test-amoled-speed.sh
+@@ -0,0 +1,26 @@
++#!/bin/sh
++# Run from serial/SSH, not from the framebuffer VT.
++# Snapshot Linux framebuffer RAM; this never reads the SPI panel.
++set -eu
++test "$(cat /sys/class/graphics/fb0/virtual_size)" = "502,410"
++stats=
++for file in /sys/bus/spi/devices/*/flush_stats; do
++	if [ -r "$file" ]; then
++		stats=$file
++		break
++	fi
++done
++test -n "$stats" || { echo "flush_stats missing: flash the new kernel" >&2; exit 1; }
++frame=/tmp/amoled-speed-$$.rgb565
++trap 'rm -f "$frame"' EXIT
++trap 'exit 1' HUP INT TERM
++cat "$stats"
++dd if=/dev/fb0 of="$frame" bs=411640 count=1
++test "$(wc -c < "$frame")" -eq 411640
++# Re-send the same image so the existing login prompt remains visible.
++for sample in 1 2 3 4 5; do
++	printf 'sample %s\n' "$sample"
++	dd if="$frame" of=/dev/fb0 bs=411640 count=1
++	sleep 1
++	cat "$stats"
++done

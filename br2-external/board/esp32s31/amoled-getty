@@ -1,0 +1,5 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# PID 1 starts this through inittab. Clear BEFORE getty prints its prompt.
+printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
+exec /sbin/getty -L tty0 115200 vt100

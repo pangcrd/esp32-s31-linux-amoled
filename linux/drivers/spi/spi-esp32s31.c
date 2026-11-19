@@ -20,9 +20,15 @@
 #include <linux/platform_device.h>
 #include <linux/pinctrl/pinconf-generic.h>
 #include <linux/reset.h>
+#include <linux/sched.h>
 #include <linux/spi/spi.h>
 
 #define S31_SPI_FIFO_SIZE	64
+
+/* Short high-speed FIFO transactions complete sooner than an IRQ round trip. */
+static bool pio_poll = true;
+module_param(pio_poll, bool, 0644);
+MODULE_PARM_DESC(pio_poll, "Poll high-speed TX-only PIO FIFO transactions");
 #define S31_SPI_CMD		0x00
 #define S31_SPI_CMD_UPDATE	BIT(23)
 #define S31_SPI_CMD_USR		BIT(24)
@@ -152,7 +158,10 @@ static size_t esp32s31_spi_max_transfer_size(struct spi_device *spi)
 {
 	struct esp32s31_spi *s = spi_controller_get_devdata(spi->controller);
 
-	return s->target && !s->rx_dma ? S31_SPI_FIFO_SIZE : SZ_4K;
+	if (s->target && !s->rx_dma)
+		return S31_SPI_FIFO_SIZE;
+	/* DMA bounce buffers are 4 KiB; PIO can stream a whole framebuffer. */
+	return s->tx_dma ? SZ_4K : SZ_512K;
 }
 
 static void esp32s31_spi_target_reset(struct esp32s31_spi *s)
@@ -461,6 +470,32 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
 	return 0;
 }
 
+/* Called only after the TX-only PIO path has disabled and synchronized IRQs.
+ * Do not sleep or initialize a completion for each 64-byte FIFO refill.
+ * Use the timekeeping-based poll with sleep_us=0 for a real bounded timeout.
+ */
+static int esp32s31_spi_poll_transaction(struct esp32s31_spi *s)
+{
+	u32 val;
+
+	writel(~0U, s->base + S31_SPI_INT_CLR);
+	writel(S31_SPI_CMD_UPDATE, s->base + S31_SPI_CMD);
+	if (readl_poll_timeout(s->base + S31_SPI_CMD, val,
+			       !(val & S31_SPI_CMD_UPDATE), 0, 1000))
+		return esp32s31_spi_transaction_error(s, "UPDATE");
+
+	writel(S31_SPI_CMD_USR, s->base + S31_SPI_CMD);
+	/* RAW avoids the race where USR has not risen on the first read yet. */
+	if (readl_poll_timeout(s->base + S31_SPI_INT_RAW, val,
+			       val & S31_SPI_TRANS_DONE, 0, 2000))
+		return esp32s31_spi_transaction_error(s, "TRANS_DONE");
+	if (readl_poll_timeout(s->base + S31_SPI_CMD, val,
+			       !(val & S31_SPI_CMD_USR), 0, 1000))
+		return esp32s31_spi_transaction_error(s, "USR");
+	writel(S31_SPI_TRANS_DONE, s->base + S31_SPI_INT_CLR);
+	return 0;
+}
+
 static void esp32s31_spi_dma_complete(void *data)
 {
 	complete(data);
@@ -669,8 +704,9 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 	u32 ctrl, user, misc;
 	u32 cs = spi_get_chipselect(spi, 0);
 	bool gpio_cs = spi_get_csgpiod(spi, 0);
+	bool poll;
 	u32 word;
-	unsigned int i, count, offset;
+	unsigned int i, count, offset, timeout_ms;
 	int ret;
 
 	if (s->target)
@@ -757,6 +793,13 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 	    xfer->tx_buf && xfer->rx_buf)
 		return esp32s31_spi_dma_duplex_transfer(s, ctlr, xfer, misc);
 
+	poll = READ_ONCE(pio_poll) && xfer->tx_buf && !xfer->rx_buf &&
+		xfer->effective_speed_hz >= 4000000;
+	if (poll) {
+		writel(0, s->base + S31_SPI_INT_ENA);
+		synchronize_irq(s->irq);
+	}
+	timeout_ms = poll ? 0 : spi_controller_xfer_timeout(ctlr, xfer);
 	for (offset = 0; offset < xfer->len; offset += S31_SPI_FIFO_SIZE) {
 		unsigned int chunk = min_t(unsigned int, S31_SPI_FIFO_SIZE,
 					       xfer->len - offset);
@@ -777,19 +820,26 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 		if (xfer->tx_buf) {
 			const u8 *tx = xfer->tx_buf;
 
-			for (i = 0; i < chunk; i += 4) {
+			/* Constant-size copies avoid a variable-length memcpy per word. */
+			for (i = 0; i + sizeof(word) <= chunk; i += sizeof(word)) {
+				memcpy(&word, tx + offset + i, sizeof(word));
+				writel(word, s->base + S31_SPI_W0 + i);
+			}
+			if (i < chunk) {
 				word = 0;
-				count = min_t(unsigned int, 4, chunk - i);
-				memcpy(&word, tx + offset + i, count);
+				memcpy(&word, tx + offset + i, chunk - i);
 				writel(word, s->base + S31_SPI_W0 + i);
 			}
 		}
 
-		ret = esp32s31_spi_wait_transaction(s,
-				spi_controller_xfer_timeout(ctlr, xfer));
+		ret = poll ? esp32s31_spi_poll_transaction(s) :
+			esp32s31_spi_wait_transaction(s, timeout_ms);
 		if (ret)
 			return ret;
 
+		/* Keep the CPU schedulable while a large GPIO-CS message is open. */
+		if (poll && !((offset + S31_SPI_FIFO_SIZE) & (SZ_4K - 1)))
+			cond_resched();
 		if (xfer->rx_buf) {
 			u8 *rx = xfer->rx_buf;
 

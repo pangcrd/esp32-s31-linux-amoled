@@ -1,0 +1,21 @@
+What:		/sys/bus/spi/devices/.../flush_stats
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read-only CO5300 framebuffer flush statistics. Output consists of
+		newline-separated key=value fields in four lines.
+
+		flushes counts attempted dirty-range flushes; errors counts failed
+		flushes. rows gives the last logical first..last row range and bytes
+		is the requested pixel payload, including unchanged alignment rows.
+
+		render_us is tiled software rotation time; spi_us includes CASET,
+		RASET and the synchronous single-header/quad-pixel message, including
+		controller/software wait time; total_us spans both. Times include
+		scheduling within the operation, but exclude the deferred-I/O delay.
+
+		full_flushes counts successful full-frame updates. full_render_us,
+		full_spi_us and full_total_us retain the latest successful full-frame
+		sample even after a partial/cursor update. max_full_us is the maximum
+		successful full-frame total since probe. Counters are per device and
+		reset at probe. Reading this file neither logs nor flushes.
