@@ -11,3 +11,7 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
 # CONFIG_LOGO is not set
 CONFIG_CMDLINE="earlycon=sbi console=tty0 console=ttyS0,115200 esp32_shm.radio_service=bt+154 root=PARTUUID=45533331-02 rootfstype=ext4 rootwait rootflags=errors=remount-ro rw"
 CONFIG_FB_DEVICE=y
+
+# SPI pixels use the S31 AXI GDMA provider; PIO remains a runtime fallback.
+CONFIG_DMADEVICES=y
+CONFIG_ESP32S31_AXI_GDMA=y

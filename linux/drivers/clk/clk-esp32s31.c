@@ -47,6 +47,8 @@
 #define HP_GPSPI_MST_CLK_DIV_NUM		GENMASK(22, 15)
 /* Bit number, not a mask: the gate API takes a bit index (see hp_init). */
 #define HP_GPSPI_MST_CLK_EN		23
+#define HP_AXI_PDMA_CTRL0		0x78
+#define HP_AXI_PDMA_FORCE_NORST		BIT(2)
 #define HP_RMT_CTRL0			0xbc
 #define HP_SDIO_HOST_CTRL0		0xc0
 #define HP_SDIO_LS_CLK_EN		3
@@ -365,6 +367,16 @@ static int esp32s31_hp_init(struct esp32s31_clk *ec)
 						    ec->base + HP_GPSPI2_CTRL0,
 						    HP_GPSPI_MST_CLK_EN, 0,
 						    &ec->lock);
+	/* AXI GDMA gate/reset, matched to S31 IDF gdma_ll.h.
+	 * The optional IDF LCD can use this clock when Linux GDMA is disabled.
+	 */
+	writel(readl(ec->base + HP_AXI_PDMA_CTRL0) & ~HP_AXI_PDMA_FORCE_NORST,
+	       ec->base + HP_AXI_PDMA_CTRL0);
+	hws[ESP32S31_CLK_AXI_GDMA] =
+		devm_clk_hw_register_gate_parent_hw(ec->dev, "axi-gdma",
+						    hws[ESP32S31_CLK_SYS], CLK_IGNORE_UNUSED,
+						    ec->base + HP_AXI_PDMA_CTRL0,
+						    0, 0, &ec->lock);
 	return 0;
 }
 
@@ -525,10 +537,11 @@ static const struct esp32s31_reset esp32s31_hp_resets[] = {
 	[ESP32S31_RST_RMT] = { HP_RMT_CTRL0, HP_PERIPH_RST_EN },
 	/* Reset is bit 2 of HP_GPSPI2_CTRL0, not bit 1 like I2C/RMT. */
 	[ESP32S31_RST_GPSPI2] = { HP_GPSPI2_CTRL0, HP_GPSPI_RST_EN },
+	[ESP32S31_RST_AXI_GDMA] = { HP_AXI_PDMA_CTRL0, HP_PERIPH_RST_EN },
 };
 
 static const struct esp32s31_clk_data esp32s31_hp_data = {
-	.nclks = ESP32S31_CLK_GPSPI2 + 1,
+	.nclks = ESP32S31_CLK_AXI_GDMA + 1,
 	.init = esp32s31_hp_init,
 	.resets = esp32s31_hp_resets,
 	.nresets = ARRAY_SIZE(esp32s31_hp_resets),

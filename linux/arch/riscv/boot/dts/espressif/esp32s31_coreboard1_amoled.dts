@@ -5,8 +5,16 @@
  * Keep the supplier sequence and the working 40 MHz from the test log.
  */
 #include "esp32s31_coreboard1.dts"
+#include <dt-bindings/dma/espressif,esp32s31-axi-gdma.h>
+
+&axi_gdma {
+	status = "okay";
+};
 
 &gpspi2 {
+	dmas = <&axi_gdma ESP32S31_GDMA_TX0 ESP32S31_GDMA_SPI2>,
+	       <&axi_gdma ESP32S31_GDMA_RX0 ESP32S31_GDMA_SPI2>;
+	dma-names = "tx", "rx";
 	espressif,gpio-cs-drive-strength = <20>;
 	/delete-node/ spidev@0;
 

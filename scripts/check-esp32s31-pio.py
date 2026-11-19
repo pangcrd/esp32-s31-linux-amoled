@@ -41,6 +41,7 @@ header = r"""
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uintptr_t dma_addr_t;
+typedef int64_t atomic64_t;
 #define __iomem
 #define BIT(n) (1U << (n))
 #define GENMASK(h, l) ((~0U >> (31-(h))) & (~0U << (l)))
@@ -50,6 +51,7 @@ typedef uintptr_t dma_addr_t;
 #define min_t(type,a,b) ((type)(a)<(type)(b)?(type)(a):(type)(b))
 #define max_t(type,a,b) ((type)(a)>(type)(b)?(type)(a):(type)(b))
 #define SZ_4K 4096
+#define SZ_32K 32768
 #define SZ_512K 524288
 #define READ_ONCE(x) (x)
 #define SPI_CPOL BIT(0)
@@ -74,7 +76,7 @@ struct spi_transfer {
     void *rx_buf;
     unsigned int len, speed_hz, effective_speed_hz;
     unsigned int tx_nbits, rx_nbits;
-    bool cs_change, last;
+    bool cs_change, last, tx_sg_mapped;
 };
 static void *spi_controller_get_devdata(struct spi_controller *c) { return c->data; }
 static u32 spi_get_chipselect(struct spi_device *spi, unsigned int n) {
@@ -92,6 +94,7 @@ static unsigned int spi_controller_xfer_timeout(struct spi_controller *c,
     (void)c; (void)t; return 200;
 }
 static bool pio_poll = true;
+static bool dma_enable = true;
 static unsigned int syncs, chunks, legacy, rescheds, target_calls, dma_calls;
 static unsigned int fail_stage, error_calls, stage, ticks, wanted_lanes;
 static unsigned int soft_resets;
@@ -190,6 +193,10 @@ static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s, struct spi_controll
                                     struct spi_transfer *t, u32 misc) {
     (void)s; (void)c; (void)t; (void)misc; dma_calls++; return 0;
 }
+static int esp32s31_spi_dma_tx_sg(struct esp32s31_spi *s, struct spi_controller *c,
+                                  struct spi_transfer *t, u32 misc) {
+    return esp32s31_spi_dma_transfer(s, c, t, misc);
+}
 static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s, struct spi_controller *c,
                                           struct spi_transfer *t, u32 misc) {
     return esp32s31_spi_dma_transfer(s, c, t, misc);
@@ -261,7 +268,7 @@ int main(void) {
     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || target_calls!=1)
         fail("target path");
     state.target=false; state.tx_dma=state.rx_dma=(struct dma_chan *)1;
-    if (esp32s31_spi_max_transfer_size(&spi)!=SZ_4K) fail("DMA bounce buffer limit");
+    if (esp32s31_spi_max_transfer_size(&spi)!=S31_SPI_DMA_MAX) fail("host DMA MS_DLEN limit");
     t.tx_buf=storage; t.rx_buf=NULL; t.len=128; reset_capture(storage,t.len);
     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || dma_calls!=1 || syncs)
         fail("DMA path preserved");

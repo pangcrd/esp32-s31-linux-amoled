@@ -23,4 +23,9 @@ for sample in 1 2 3 4 5; do
 	dd if="$frame" of=/dev/fb0 bs=411640 count=1
 	sleep 1
 	cat "$stats"
+	for dma_stats in /sys/class/spi_master/spi*/device/dma_stats; do
+		if [ -r "$dma_stats" ]; then
+			cat "$dma_stats"
+		fi
+	done
 done

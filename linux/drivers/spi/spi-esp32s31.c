@@ -8,6 +8,7 @@
  * ARCH_ESPRESSIF.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
@@ -24,6 +25,12 @@
 #include <linux/spi/spi.h>
 
 #define S31_SPI_FIFO_SIZE	64
+/* MS_DATA_BITLEN is 18 bits: at most 262144 bits per DMA transaction. */
+#define S31_SPI_DMA_MAX		SZ_32K
+
+static bool dma_enable = true;
+module_param(dma_enable, bool, 0644);
+MODULE_PARM_DESC(dma_enable, "Use DMA when channels are present; N selects PIO");
 
 /* Short high-speed FIFO transactions complete sooner than an IRQ round trip. */
 static bool pio_poll = true;
@@ -111,6 +118,7 @@ struct esp32s31_spi {
 	u32 max_data_lines;
 	u32 gpio_cs_drive_strength;
 	int irq;
+	atomic64_t dma_tx_transfers, dma_tx_bytes, dma_errors;
 	bool target;
 	bool polling;
 	bool target_aborted;
@@ -160,8 +168,8 @@ static size_t esp32s31_spi_max_transfer_size(struct spi_device *spi)
 
 	if (s->target && !s->rx_dma)
 		return S31_SPI_FIFO_SIZE;
-	/* DMA bounce buffers are 4 KiB; PIO can stream a whole framebuffer. */
-	return s->tx_dma ? SZ_4K : SZ_512K;
+	/* Host SG DMA is bounded by MS_DLEN; target bounce buffers remain 4 KiB. */
+	return s->tx_dma ? (s->target ? SZ_4K : S31_SPI_DMA_MAX) : SZ_512K;
 }
 
 static void esp32s31_spi_target_reset(struct esp32s31_spi *s)
@@ -437,7 +445,7 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
 	writel(~0U, s->base + S31_SPI_INT_CLR);
 	writel(S31_SPI_CMD_UPDATE, s->base + S31_SPI_CMD);
 	if (readl_poll_timeout(s->base + S31_SPI_CMD, cmd,
-			       !(cmd & S31_SPI_CMD_UPDATE), 1, 1000))
+			       !(cmd & S31_SPI_CMD_UPDATE), 0, 1000))
 		return esp32s31_spi_transaction_error(s, "UPDATE");
 
 	if (!s->polling)
@@ -464,7 +472,7 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
 	writel(0, s->base + S31_SPI_INT_ENA);
 	/* The IRQ can precede CMD.USR falling. Keep GPIO CS low until idle. */
 	if (readl_poll_timeout(s->base + S31_SPI_CMD, cmd,
-			       !(cmd & S31_SPI_CMD_USR), 1, 100000))
+			       !(cmd & S31_SPI_CMD_USR), 0, 100000))
 		return esp32s31_spi_transaction_error(s, "USR");
 	writel(S31_SPI_TRANS_DONE, s->base + S31_SPI_INT_CLR);
 	return 0;
@@ -499,6 +507,97 @@ static int esp32s31_spi_poll_transaction(struct esp32s31_spi *s)
 static void esp32s31_spi_dma_complete(void *data)
 {
 	complete(data);
+}
+
+static bool esp32s31_spi_can_dma(struct spi_controller *ctlr,
+				 struct spi_device *spi, struct spi_transfer *xfer)
+{
+	struct esp32s31_spi *s = spi_controller_get_devdata(ctlr);
+
+	return !s->target && s->tx_dma && s->rx_dma && READ_ONCE(dma_enable) &&
+	       xfer->tx_buf && !xfer->rx_buf && xfer->len > S31_SPI_FIFO_SIZE &&
+	       IS_ALIGNED((unsigned long)xfer->tx_buf, 4);
+}
+
+/* SPI core maps vmalloc pixels page by page and performs PSRAM cache sync. */
+static int esp32s31_spi_dma_tx_sg(struct esp32s31_spi *s,
+				  struct spi_controller *ctlr,
+				  struct spi_transfer *xfer, u32 misc)
+{
+	struct dma_slave_config config = {
+		.direction = DMA_MEM_TO_DEV,
+		.src_addr = s->fifo_addr, .dst_addr = s->fifo_addr,
+		.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+		.src_maxburst = 8, .dst_maxburst = 8,
+	};
+	struct dma_async_tx_descriptor *desc;
+	dma_cookie_t cookie;
+	unsigned int timeout_ms = spi_controller_xfer_timeout(ctlr, xfer);
+	u32 conf, raw;
+	int ret;
+
+	if (!xfer->tx_sg.nents || xfer->len > S31_SPI_DMA_MAX)
+		return -EINVAL;
+	ret = dmaengine_slave_config(s->tx_dma, &config);
+	if (ret)
+		goto error;
+	desc = dmaengine_prep_slave_sg(s->tx_dma, xfer->tx_sg.sgl, xfer->tx_sg.nents,
+				       DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	reinit_completion(&s->dma_tx_done);
+	desc->callback = esp32s31_spi_dma_complete;
+	desc->callback_param = &s->dma_tx_done;
+	cookie = dmaengine_submit(desc);
+	ret = dma_submit_error(cookie);
+	if (ret)
+		goto terminate;
+	conf = readl(s->base + S31_SPI_DMA_CONF) &
+	       ~(S31_SPI_DMA_TX_EN | S31_SPI_DMA_RX_EN);
+	/* Same TX DMA FIFO reset and enable sequence as the pinned IDF LL. */
+	writel(conf | S31_SPI_DMA_AFIFO_RST, s->base + S31_SPI_DMA_CONF);
+	writel(conf, s->base + S31_SPI_DMA_CONF);
+	writel(S31_SPI_MST_RX_AFIFO_WFULL_ERR | S31_SPI_MST_TX_AFIFO_REMPTY_ERR,
+	       s->base + S31_SPI_INT_CLR);
+	writel(conf | S31_SPI_DMA_TX_EN, s->base + S31_SPI_DMA_CONF);
+	writel(misc, s->base + S31_SPI_MISC);
+	writel(xfer->len * 8 - 1, s->base + S31_SPI_MS_DLEN);
+	dma_async_issue_pending(s->tx_dma);
+	ret = esp32s31_spi_wait_transaction(s, timeout_ms);
+	if (ret)
+		goto stop;
+	if (!wait_for_completion_timeout(&s->dma_tx_done, msecs_to_jiffies(timeout_ms))) {
+		ret = -ETIMEDOUT;
+		goto stop;
+	}
+	if (dma_async_is_tx_complete(s->tx_dma, cookie, NULL, NULL) != DMA_COMPLETE) {
+		ret = -EIO;
+		goto stop;
+	}
+	raw = readl(s->base + S31_SPI_INT_RAW);
+	if (raw & (S31_SPI_MST_RX_AFIFO_WFULL_ERR | S31_SPI_MST_TX_AFIFO_REMPTY_ERR)) {
+		ret = -EIO;
+		goto stop;
+	}
+	writel(conf, s->base + S31_SPI_DMA_CONF);
+	atomic64_inc(&s->dma_tx_transfers);
+	atomic64_add(xfer->len, &s->dma_tx_bytes);
+	return 0;
+stop:
+	writel(0, s->base + S31_SPI_INT_ENA);
+	synchronize_irq(s->irq);
+	/* Stop GPSPI before terminating DMA and before core releases CS/unmaps SG. */
+	esp32s31_spi_target_reset(s);
+	writel(conf, s->base + S31_SPI_DMA_CONF);
+terminate:
+	dmaengine_terminate_sync(s->tx_dma);
+error:
+	atomic64_inc(&s->dma_errors);
+	dev_err_ratelimited(s->dev, "TX SG DMA failed: %d, length=%u\n", ret, xfer->len);
+	return ret;
 }
 
 static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s,
@@ -786,10 +885,17 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 		misc |= BIT(cs + 7);
 	if (spi->mode & SPI_CPOL)
 		misc |= S31_SPI_CK_IDLE_EDGE;
-	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
+	if (!gpio_cs && !xfer->cs_change && !spi_transfer_is_last(ctlr, xfer))
+		misc |= S31_SPI_CS_KEEP_ACTIVE;
+	/* Route mapped TX by the mapping, even if dma_enable changes mid-message. */
+	if (xfer->tx_buf && !xfer->rx_buf && xfer->tx_sg_mapped)
+		return esp32s31_spi_dma_tx_sg(s, ctlr, xfer, misc);
+	if (READ_ONCE(dma_enable) && s->tx_dma && s->rx_dma &&
+	    xfer->len > S31_SPI_FIFO_SIZE && xfer->len <= SZ_4K &&
 	    (!!xfer->tx_buf != !!xfer->rx_buf))
 		return esp32s31_spi_dma_transfer(s, ctlr, xfer, misc);
-	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
+	if (READ_ONCE(dma_enable) && s->tx_dma && s->rx_dma &&
+	    xfer->len > S31_SPI_FIFO_SIZE && xfer->len <= SZ_4K &&
 	    xfer->tx_buf && xfer->rx_buf)
 		return esp32s31_spi_dma_duplex_transfer(s, ctlr, xfer, misc);
 
@@ -877,6 +983,25 @@ static void esp32s31_spi_free_dma_buffer(void *data)
 		dma_free_noncoherent(s->dev, SZ_4K, s->rx_dma_buf,
 				     s->rx_dma_addr, DMA_FROM_DEVICE);
 }
+
+static ssize_t dma_stats_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct esp32s31_spi *s = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+		"dma_available=%c dma_enabled=%c tx_transfers=%lld tx_bytes=%lld errors=%lld\n",
+		s->tx_dma && s->rx_dma ? 'Y' : 'N', READ_ONCE(dma_enable) ? 'Y' : 'N',
+		atomic64_read(&s->dma_tx_transfers), atomic64_read(&s->dma_tx_bytes),
+		atomic64_read(&s->dma_errors));
+}
+static DEVICE_ATTR_RO(dma_stats);
+
+static struct attribute *esp32s31_spi_attrs[] = {
+	&dev_attr_dma_stats.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(esp32s31_spi);
 
 static int esp32s31_spi_probe(struct platform_device *pdev)
 {
@@ -1025,9 +1150,19 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
 	ctlr->max_transfer_size = esp32s31_spi_max_transfer_size;
 	ctlr->setup = esp32s31_spi_setup;
 	ctlr->transfer_one = esp32s31_spi_transfer_one;
+	ctlr->can_dma = esp32s31_spi_can_dma;
+	ctlr->dma_tx = s->tx_dma;
+	ctlr->dma_rx = s->rx_dma;
+	ctlr->max_dma_len = S31_SPI_DMA_MAX;
 	if (target)
 		ctlr->target_abort = esp32s31_spi_target_abort;
 
+	atomic64_set(&s->dma_tx_transfers, 0);
+	atomic64_set(&s->dma_tx_bytes, 0);
+	atomic64_set(&s->dma_errors, 0);
+	platform_set_drvdata(pdev, s);
+	dev_info(&pdev->dev, "transfer engine: %s; PIO fallback available\n",
+		 s->tx_dma ? "AXI GDMA TX SG, max 32768 bytes" : "PIO");
 	return devm_spi_register_controller(&pdev->dev, ctlr);
 }
 
@@ -1042,6 +1177,7 @@ static struct platform_driver esp32s31_spi_driver = {
 	.driver = {
 		.name = "esp32s31-gpspi",
 		.of_match_table = esp32s31_spi_of_match,
+		.dev_groups = esp32s31_spi_groups,
 	},
 };
 module_platform_driver(esp32s31_spi_driver);
