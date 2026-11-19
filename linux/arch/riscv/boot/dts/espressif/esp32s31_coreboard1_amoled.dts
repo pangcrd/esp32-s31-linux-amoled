@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+
 /* PCB wiring from the existing shield DTS; geometry and init sequence are
- * for the C05300AF-51 module on this shield: 410x502, x-offset 22,
- * supplier init in the supplier's order (FE/C4/3A/35/53/51/63/11, 600 ms
+ * for the C05300AF-51 module on this shield, rotated to landscape
+ * (502x410) via MADCTL 0x60 (row/column exchange + column order):
+ * logical width 502 maps to the native 502 rows (x-offset 0), logical
+ * height 410 maps to native columns 22..431 (y-offset 22). Supplier
+ * init in the supplier's order (FE/C4/3A/36/35/53/51/63/11, 600 ms
  * after Sleep Out). 0x35 carries its data byte (0x00); 0x29 (Display On)
  * is appended by the driver. Do NOT use the Espressif 466x466 reference
- * values.
+ * values. SPI runs at 20 MHz (the panel's proven ESP-IDF rate); 1 MHz
+ * was too slow to keep up with the boot log.
  */
 #include "esp32s31_coreboard1.dts"
 
@@ -15,17 +19,18 @@
 	panel@0 {
 		compatible = "chipone,co5300";
 		reg = <0>;
-		spi-max-frequency = <1000000>;
+		spi-max-frequency = <20000000>;
 		spi-tx-bus-width = <4>;
 		reset-gpios = <&pinctrl 0 GPIO_ACTIVE_LOW>;
-		chipone,width = <410>;
-		chipone,height = <502>;
-		chipone,x-offset = <22>;
-		chipone,y-offset = <0>;
+		chipone,width = <502>;
+		chipone,height = <410>;
+		chipone,x-offset = <0>;
+		chipone,y-offset = <22>;
 		/* Record format: [cmd, len, delay-ms BE16, data...] */
 		chipone,init-sequence = [fe 01 00 00 00 c4 01 00 00 80
-					  3a 01 00 00 55 35 01 00 00 00
-					  53 01 00 00 20 51 01 00 00 ff
-					  63 01 00 00 ff 11 00 02 58];
+					  3a 01 00 00 55 36 01 00 00 60
+					  35 01 00 00 00 53 01 00 00 20
+					  51 01 00 00 ff 63 01 00 00 ff
+					  11 00 02 58];
 	};
 };

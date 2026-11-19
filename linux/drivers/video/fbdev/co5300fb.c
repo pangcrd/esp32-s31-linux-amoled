@@ -235,17 +235,18 @@ static int co5300fb_init_sequence(struct co5300fb *p)
 {
 	static const u8 defaults[] = {
 		/* Supplier init for the C05300AF-51 410x502 module (proven
-		 * under ESP-IDF), in the supplier's order: FE, C4, 3A, 35,
-		 * 53, 51, 63, 11 (600 ms). 0x35 carries its data byte
+		 * under ESP-IDF), in the supplier's order: FE, C4, 3A, 36,
+		 * 35, 53, 51, 63, 11 (600 ms). 0x35 carries its data byte
 		 * (0x00) — sending it with no data desyncs the panel's
 		 * command parser and the commands after it (53/51/63/11/
-		 * 29) are misread, leaving the display off. 0x36 (MADCTL)
-		 * is not sent; the panel's power-up default (0x00) is the
-		 * one the ESP-IDF test uses. 0x29 (Display On) is sent
-		 * after this table. */
+		 * 29) are misread, leaving the display off. 0x36 is MADCTL
+		 * 0x60 (landscape: row/column exchange + column order);
+		 * without it the panel shows portrait. 0x29 (Display On)
+		 * is sent after this table. */
 		0xfe, 1, 0, 0, 0x00,
 		0xc4, 1, 0, 0, 0x80,
 		0x3a, 1, 0, 0, 0x55,
+		0x36, 1, 0, 0, 0x60,
 		0x35, 1, 0, 0, 0x00,
 		0x53, 1, 0, 0, 0x20,
 		0x51, 1, 0, 0, 0xff,
@@ -298,11 +299,13 @@ static int co5300fb_probe(struct spi_device *spi)
 	p = info->par;
 	p->spi = spi;
 	spin_lock_init(&p->damage_lock);
-	/* Defaults are the C05300AF-51 module on this shield; DT properties
+	/* Defaults are the C05300AF-51 module on this shield, landscape
+	 * (502x410) via MADCTL 0x60; DT properties
 	 * (chipone,width/height/x-offset/y-offset) override them. */
-	p->width = 410;
-	p->height = 502;
-	p->xoff = 22;
+	p->width = 502;
+	p->height = 410;
+	p->xoff = 0;
+	p->yoff = 22;
 	device_property_read_u32(dev, "chipone,width", &p->width);
 	device_property_read_u32(dev, "chipone,height", &p->height);
 	device_property_read_u32(dev, "chipone,x-offset", &p->xoff);

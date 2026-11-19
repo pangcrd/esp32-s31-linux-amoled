@@ -38,26 +38,26 @@ properties:
     description: Visible width in pixels.
     minimum: 1
     maximum: 512
-    default: 410
+    default: 502
 
   chipone,height:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Visible height in pixels.
     minimum: 1
     maximum: 512
-    default: 502
+    default: 410
 
   chipone,x-offset:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: First visible column in controller RAM.
     maximum: 65534
-    default: 22
+    default: 0
 
   chipone,y-offset:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: First visible row in controller RAM.
     maximum: 65534
-    default: 0
+    default: 22
 
   chipone,init-sequence:
     $ref: /schemas/types.yaml#/definitions/uint8-array
