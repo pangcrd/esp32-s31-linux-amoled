@@ -9,8 +9,13 @@ CONFIG_VT_CONSOLE=y
 CONFIG_FRAMEBUFFER_CONSOLE=y
 # CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER is not set
 # CONFIG_LOGO is not set
-CONFIG_CMDLINE="earlycon=sbi console=tty0 console=ttyS0,115200 esp32_shm.radio_service=bt+154 root=PARTUUID=45533331-02 rootfstype=ext4 rootwait rootflags=errors=remount-ro rw"
+CONFIG_CMDLINE="earlycon=sbi console=tty0 console=ttyS0,115200 esp32_shm.radio_service=bt+154 root=PARTUUID=45533331-02 rootfstype=ext4 rootwait rootflags=errors=remount-ro rw fbcon=font:SUN12x22"
 CONFIG_FB_DEVICE=y
+# Console fonts: SUN12x22 (12x22, slightly larger than the 8x16 default)
+# is the boot font; SUN16x32 is also built in for a bigger option.
+CONFIG_FONTS=y
+CONFIG_FONT_SUN12x22=y
+CONFIG_FONT_16x32=y
 
 # SPI pixels use the S31 AXI GDMA provider; PIO remains a runtime fallback.
 CONFIG_DMADEVICES=y

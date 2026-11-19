@@ -2,4 +2,7 @@
 # SPDX-License-Identifier: MIT
 # PID 1 starts this through inittab. Clear BEFORE getty prints its prompt.
 printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
+# Push the login banner down 3 lines so it clears the panel's rounded
+# top corners (40 px safe inset); the console itself stays full-screen.
+printf '\n\n\n' > /dev/tty0
 exec /sbin/getty -L tty0 115200 vt100
