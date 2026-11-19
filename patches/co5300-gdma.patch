@@ -1,0 +1,2141 @@
+diff --git a/br2-external/board/esp32s31/linux-amoled.fragment b/br2-external/board/esp32s31/linux-amoled.fragment
+index 6df4938..1c21307 100644
+--- a/br2-external/board/esp32s31/linux-amoled.fragment
++++ b/br2-external/board/esp32s31/linux-amoled.fragment
+@@ -11,3 +11,7 @@ CONFIG_FRAMEBUFFER_CONSOLE=y
+ # CONFIG_LOGO is not set
+ CONFIG_CMDLINE="earlycon=sbi console=tty0 console=ttyS0,115200 esp32_shm.radio_service=bt+154 root=PARTUUID=45533331-02 rootfstype=ext4 rootwait rootflags=errors=remount-ro rw"
+ CONFIG_FB_DEVICE=y
++
++# SPI pixels use the S31 AXI GDMA provider; PIO remains a runtime fallback.
++CONFIG_DMADEVICES=y
++CONFIG_ESP32S31_AXI_GDMA=y
+diff --git a/docs/co5300-gdma.md b/docs/co5300-gdma.md
+new file mode 100644
+index 0000000..d0a1f53
+--- /dev/null
++++ b/docs/co5300-gdma.md
+@@ -0,0 +1,246 @@
++# CO5300: AXI GDMA cho GPSPI2
++
++Cơ sở patch: fix/co5300-speed-clean @
++ab6cd0be1ff52c1baac86ac93629af7b88e7a33b.
++Ngày: 2026-11-19. DMA mới đã qua kiểm tra trên host, chưa chạy trên board.
++
++## Kết luận từ log và source
++
++Đã dùng docs/gdma-dma.md và log được người dùng cung cấp. docs/test_log.md
++không có trong workspace; đã đọc docs/test_log-2.md, docs/user_test_log.md và
++docs/amoled-spi-debug.md ở lượt trước.
++
++PIO đã được người dùng đo: full_total_us 124003, 82680, 87667, 170281, 82431;
++median 87667 us, render khoảng 14.8 ms, errors=0. Đây là kết quả của PIO ab6cd0b,
++không phải số đo của patch DMA. Không thử lại reset/init/wiring/đọc panel.
++
++Linux 7.3.4 và overlay hiện không có provider GDMA cho S31. Donor GrieferPig
++có esp32s31-axi-gdma.c và esp32s31-ahb-gdma.c; đã kiểm tra donor, không giả định
++rằng phần cứng không có DMA.
++
++TRM và ESP-IDF thống nhất GPSPI2 dùng **AXI GDMA**, selector 1. AHB GDMA không
++kết nối GPSPI2. TRM có 3 TX + 3 RX độc lập; chỉ memory-to-memory mới cần ghép
++TX/RX cùng số. Driver mới cung cấp 6 directional channel cho slave-SG,
++không bật memcpy/memset/cyclic chưa cần cho panel.
++
++SPI branch hiện có bounce DMA, nhưng không có dmas trên node và không có
++provider, nên luôn PIO. Có DMA sẽ đổi max_transfer_size thành 4 KiB; full
++frame bị SPI core chia khoảng 101 transfers, mỗi transfer phải copy/sync,
++arm DMA rồi chờ hai completion.
++
++Một giới hạn quan trọng khác: **MS_DATA_BITLEN chỉ có 18 bit**, tính theo
++số bit trừ một. Tối đa 262144 bit = 32768 byte. Không thể chỉ tăng buffer
++hay ghi 411640 * 8 - 1 vào MS_DLEN cho một transaction.
++
++## Thay đổi
++
++- Thêm AXI GDMA dmaengine provider, register layout/slave-SG model đối chiếu
++  donor và TRM. Mỗi RX/TX half có vchan, IRQ và lifecycle độc lập.
++- Descriptor ba word, padding thành 16 byte để địa chỉ 8-byte aligned.
++  Dùng dma_pool trong coherent SRAM pool sẵn có; payload có thể ở PSRAM.
++  Mỗi descriptor tối đa 4032 byte (<= 4095, multiple của cache line 64).
++  Owner được bật; chỉ descriptor TX cuối có suc_eof. RX length/eof khởi tạo 0.
++- Claim peripheral được serialize; không cho hai channel cùng direction
++  nối cùng peripheral. RX0/TX0 dùng chung SPI2 selector 1 là hợp lệ.
++- Bật owner check, descriptor burst, 32-byte memory burst, TX EOF sau khi
++  data được pop. TX hoàn tất ở TOTAL_EOF, không ở từng descriptor DONE.
++- Abort/stop rồi chờ RESET_AVAIL trước reset/free descriptor. DMA errors
++  thành DMA_ERROR. Khi reset chưa an toàn, giữ descriptor thay vì free nó
++  trong khi DMA còn có thể dùng.
++- Thêm clock/reset AXI GDMA vào provider clock hiện có; CLK_IGNORE_UNUSED
++  giữ clock cho LCD firmware tùy chọn khi Linux GDMA không được enable. Thêm DT node
++  0x20348000/0x2000, IRQ rx0/tx0/rx1/tx1/rx2/tx2. Node mặc định disabled;
++  chỉ AMOLED DTS enable và thêm dmas/dma-names tx/rx.
++- AMOLED fragment bật DMADEVICES và ESP32S31_AXI_GDMA; các dependencies
++  DMA_ENGINE/DMA_VIRTUAL_CHANNELS do Kconfig select.
++- Host TX-only dùng SPI core SG mapping trực tiếp từ buffer pixels vmalloc.
++  Không copy cả pixels vào bounce buffer. SPI core map/sync PSRAM cache
++  theo DMA device của channel; không tự trộn physical/virtual addresses.
++- Host max_transfer_size 32 KiB, đúng MS_DLEN. SPI core tự chia:
++  12 x 32768 + 18424 = 411640 byte, tổng 13 transaction DMA.
++  Vẫn một CASET/RASET window, một message và một GPIO-CS assertion.
++  Header 32 00 2c 00 vẫn một lane; mọi pixel transfer vẫn quad, cùng thứ tự.
++- Giữ DMA bounce RX/duplex/target 4 KiB hiện có. Host RX/duplex lớn hơn
++  bounce buffer dùng PIO, tránh overflow khi cap host tăng lên 32 KiB.
++  Không sửa hoặc đề xuất kiểm tra lại SPI panel-read path.
++- UPDATE/USR polling ở helper IRQ không ngủ từng microsecond; phần truyền
++  dài vẫn chờ IRQ/completion, để CPU làm việc khác thay vì nạp FIFO.
++- Giữ pio_poll. Thêm dma_enable=Y mặc định; N chọn PIO để fallback/A-B.
++  Transfer đã SG-map vẫn hoàn thành bằng DMA nếu parameter đổi giữa message.
++- Thêm dma_stats của controller: available/enabled, số TX SG transfers,
++  bytes và errors. Chỉ tăng counters thành công sau cả DMA và GPSPI idle.
++  Kiểm tra DMA status/AFIFO errors để không trả 0 khi DMA lỗi.
++- co5300fb.c, wrapper getty và post-build.sh giữ nguyên từng byte so với ab6cd0b.
++  flush_stats, landscape 502x410, 40 MHz, init và các delays vẫn như bản đã test.
++
++PIO fallback và cap 32 KiB với channel đã được cấp vẫn giữ message/CS. Panel
++dùng GPIO-CS. Với native-CS, patch giữ KEEP_ACTIVE nếu còn transfer trong
++message; không deassert giữa các chunk DMA.
++
++## Register/API evidence và giới hạn tài liệu
++
++TRM chính thức đã đọc: ESP32-S31 Technical Reference Manual, Pre-release v0.2:
++https://documentation.espressif.com/esp32-s31_technical_reference_manual_en.pdf
++
++| Phần | Nguồn đối chiếu |
++| --- | --- |
++| AXI GDMA, 3 TX + 3 RX, PSRAM support | TRM p97–99 |
++| Descriptor fields, owner/eof, 8-byte alignment | TRM p100–101 |
++| SPI2 selector 1, peripheral exclusivity | TRM p101–102, table 3.4-3 |
++| IRQ events, reset/clock procedure | TRM p110–112 |
++| RX/TX register offsets, stride 0x68 | TRM p125–128 |
++| CONF0/CONF1, burst, owner-check, LINK1/LINK2 | TRM p206–216 |
++| RESET_AVAIL 0x28c/0x298, MISC 0x2a8 | TRM p220–221 |
++| Internal/external memory windows, base 0x20348000 size 8 KiB | TRM p319, table 5.3-2 |
++
++ESP-IDF pinned revision:
++fff9895c82d744c7237be8847347bdd1b07c6643.
++Files: components/esp_hal_dma/esp32s31/include/hal/{gdma_ll,axi_dma_ll,gdma_channel}.h,
++components/soc/esp32s31/register/soc/{axi_dma_reg,hp_sys_clkrst_reg,spi_reg}.h,
++components/soc/esp32s31/include/soc/interrupts.h,
++components/esp_hal_gpspi/esp32s31/include/hal/spi_ll.h.
++
++Đã kiểm tra APM trong bootloader/main/main.c và opensbi/platform/esp32s31/platform.c:
++SRAM pool/PSRAM thông thường được mở, vùng firmware M-mode vẫn được bảo vệ.
++Không thêm thao tác đổi quyền APM hay thay bootloader/OpenSBI cho DMA này.
++
++Donor pinned:
++https://github.com/GrieferPig/linux-esp32-s31/blob/2bf05bc5f379066cf5f64d750afbb0b4ba0bf364/drivers/dma/esp32s31-axi-gdma.c
++
++**TRM v0.2 chưa xuất bản chương SPI, Reset/Clock và Interrupt Matrix.**
++Vì vậy không thể khẳng định mọi offset của các phần đó đã được đối chiếu TRM:
++HP_SYS_CLKRST_AXI_PDMA_CTRL0 offset 0x78, gate bit 0/reset bit 1/FORCE_NORST
++bit 2; IRQ source IDs RX 48/49/50, TX 51/52/53; SPI MS_DLEN 0x1c, field
++17:0 và FIFO-reset sequence được đối chiếu các file ESP-IDF pinned ở trên.
++Đã hỏi người dùng về TRM đầy đủ hơn. Đây là giới hạn nguồn tài liệu công khai,
++không phải bằng chứng GDMA bị phần cứng chặn.
++
++API được kiểm tra trong Linux 7.3.4 thực tế:
++virt-dma.h/dmaengine.h, dma_pool, devm_clk_get_enabled, reset assert/deassert,
++of_dma_controller_register, dma_get_slave_channel, slave SG, cookie status,
++termination/synchronization, atomic64 và device dev_groups.
++SPI core spi.c tự split theo max_transfer_size, map vmalloc theo trang và
++sync SG trước transfer; metadata lanes/CS được giữ qua splitting.
++
++## Kết quả kiểm tra host
++
++- GDMA, SPI, clock object compile với Linux 7.3.4, W=1: PASS.
++  Host x86_64 compile-test; chưa build/flash cả image RISC-V tại đây.
++- check-esp32s31-dma.py với ASan/UBSan: PASS. Code thật cho SG LLIs, tails,
++  unaligned/range/512K, allocation failures, IRQ/error/abort, channel claims;
++  SPI TX-SG + provider code thật cho 13 transfers/411640 bytes, quad/MS_DLEN,
++  errors/cleanup/counters/fallback.
++- PIO regression và framebuffer/rotation/window regression: PASS.
++- DTS preprocess + dtc: PASS. DTB có GDMA okay, 6 IRQ đúng thứ tự,
++  tx=<GDMA TX0 SPI2>/rx=<GDMA RX0 SPI2>, 40 MHz và 502x410.
++- Kconfig/Makefile patch áp dụng vào Linux 7.3.4: PASS.
++- checkpatch --strict: không lỗi code; cảnh báo MAINTAINERS chuẩn khi thêm
++  driver mới được ghi nhận (overlay này không có MAINTAINERS riêng).
++- git apply --check và apply thật lên clone mới fix/co5300-speed-clean,
++  rồi chạy lại các regression trên source đã apply: PASS.
++
++Fake MMIO không chứng minh DMA trên silicon, bus timing hoặc hết vạch quét.
++Nền tảng thời gian lý tưởng là khoảng 14.8 ms render + 20.6 ms bits, còn cache
++sync, 13 arm/completion và scheduling. Mục tiêu 30–50 ms là kỳ vọng để đo,
++không phải số đo đã đạt. Dưới 100 ms cũng không tự chứng minh hết tearing
++do panel quét độc lập.
++
++## WSL2: patch, build, flash
++
++Dùng bootloader artifacts và output AMOLED đã build thành công trước đó.
++Có thay đổi kernel config/DT/provider nên phải rebuild kernel qua linux-dirclean.
++Không cần rebuild mọi package userspace từ đầu; USB rootfs có getty của bản PIO
++có thể dùng tiếp. Buildroot make có thể đóng gói rootfs lại, nhưng bản DMA
++không yêu cầu ghi USB mới. Flash phần thay đổi nằm trong flash.bin.
++
++Nếu muốn giữ/share cặp PIO đã test, chạy prepare-amoled-share.py theo checklist
++TRƯỚC khi build DMA ghi đè output cũ.
++
++    cd ~/s31-linux
++    git fetch origin
++    git switch -c test/co5300-gdma origin/fix/co5300-speed-clean
++    curl --fail --location \
++      https://raw.githubusercontent.com/pangcrd/esp32-s31-linux-amoled/fix/co5300-gdma/patches/co5300-gdma.patch \
++      -o /tmp/co5300-gdma.patch
++    git apply --check /tmp/co5300-gdma.patch
++    git apply /tmp/co5300-gdma.patch
++
++    python3 scripts/check-esp32s31-dma.py \
++      linux/drivers/dma/esp32s31-axi-gdma.c linux/drivers/spi/spi-esp32s31.c
++    python3 scripts/check-esp32s31-pio.py linux/drivers/spi/spi-esp32s31.c
++    python3 scripts/check-co5300-windows.py linux/drivers/video/fbdev/co5300fb.c
++
++    unset ESP32S31_VERSION
++    export ESP32S31_VERSION="$(make -s version)"
++    BR_OUT="$PWD/build/br-output-coreboard1-amoled"
++    sh scripts/enable-amoled.sh "$BR_OUT"
++    make -C external/buildroot O="$BR_OUT" BR2_EXTERNAL="$PWD/br2-external"
++
++    grep -E '^CONFIG_(DMADEVICES|DMA_ENGINE|DMA_VIRTUAL_CHANNELS|ESP32S31_AXI_GDMA)=' \
++      "$BR_OUT/build/linux-7.3.4/.config"
++    sh scripts/copy-images.sh "$BR_OUT/images" build/coreboard1 \
++      bootloader/partitions-coreboard1.csv
++    make -s flash-args BOARD=coreboard1 > build/coreboard1/flash-args.txt
++    source ~/esp/esp-idf/export.sh
++    python -m esptool --chip esp32s31 merge-bin \
++      -o build/coreboard1/flash.bin @build/coreboard1/flash-args.txt
++    FLASH_PORT=/dev/ttyACM0
++    python -m esptool --chip esp32s31 --port "$FLASH_PORT" --baud 921600 \
++      write-flash 0x0 build/coreboard1/flash.bin
++
++Đặt FLASH_PORT thành port đang dùng. Kernel config grep phải có bốn dòng =y.
++enable-amoled.sh đã chạy linux-dirclean. Không dùng scripts/ci-build.sh.
++Nếu output AMOLED chưa tồn tại, tạo coreboard1_defconfig ở output riêng rồi
++enable AMOLED như hướng dẫn speed-clean; không áp lại defconfig lên output
++đã enable. Nếu checkout fix/co5300-gdma trực tiếp thì không git apply thêm.
++
++## Board: chứng minh DMA active và đo 5 mẫu
++
++Chạy qua UART/SSH, không qua VT trên panel. Không cần Python hoặc pkill.
++
++    dmesg | grep -E 'AXI GDMA|transfer engine|co5300|DMA.*error|timeout'
++    cat /sys/class/graphics/fb0/virtual_size
++    cat /sys/module/spi_esp32s31/parameters/dma_enable
++    cat /sys/module/spi_esp32s31/parameters/pio_poll
++    cat /sys/class/spi_master/spi2/device/dma_stats
++    cat /sys/bus/spi/devices/*/flush_stats
++
++Kỳ vọng log "AXI GDMA ready" và "transfer engine: AXI GDMA TX SG, max 32768 bytes";
++fb0 vẫn 502,410, 40000000 Hz; dma_enable=Y và pio_poll=Y.
++dma_stats phải available=Y/enabled=Y, tx_transfers/tx_bytes tăng, errors=0.
++Chỉ log "ready" không chứng minh pixels đã đi bằng DMA; counters là kiểm tra
++đường TX đã chạy và hoàn tất thành công.
++
++Từ WSL2:
++
++    scp scripts/test-amoled-speed.sh root@192.168.0.182:/tmp/test-amoled-speed.sh
++
++Thay IP theo board. Ở UART/SSH:
++
++    sh /tmp/test-amoled-speed.sh
++
++Script giữ cách test cũ: snapshot RAM framebuffer rồi ghi lại 411640 byte
++5 lần, không xoá prompt và không đọc panel qua SPI. Có thêm dma_stats mỗi mẫu.
++Mỗi full frame dùng 13 DMA transactions; ngoài cursor update, counters
++tăng ít nhất 65 transactions/2058200 bytes qua 5 mẫu. Xem full_* stats,
++không dùng total_us của partial/cursor update.
++
++Acceptance cần đo trên board: full_total_us < 100000 cho CẢ 5 mẫu, hướng đến
++30000–50000; full_render_us khoảng 15000; errors=0; không timeout; mắt xác
++nhận scroll mượt/vạch quét; getty sạch sau reboot. Chưa đánh dấu acceptance
++này là đạt.
++
++Fallback/A-B phần mềm:
++
++    printf 'N\n' > /sys/module/spi_esp32s31/parameters/dma_enable
++    sh /tmp/test-amoled-speed.sh
++    printf 'Y\n' > /sys/module/spi_esp32s31/parameters/dma_enable
++
++N dùng PIO polling đã chứng minh; DMA counters không tăng cho các frame đó.
++Parameter có tác dụng khi channels/provider đã probe. Nếu provider không
++probe, giữ UART log và dùng flash.bin PIO đã lưu để quay lại bản đã test.
++Không yêu cầu kiểm tra lại wiring, reset, SPI reads hay đổi clock.
++
++Gửi lại log probe + 5 mẫu DMA. Nếu bits/transfer nhanh nhưng full_total_us
++còn jitter, số liệu đó sẽ tách scheduler/13-completion overhead khỏi transpose.
++Không tự gán phép đo PIO cũ cho DMA mới.
+diff --git a/docs/share-pack-checklist.md b/docs/share-pack-checklist.md
+new file mode 100644
+index 0000000..a319671
+--- /dev/null
++++ b/docs/share-pack-checklist.md
+@@ -0,0 +1,120 @@
++# Share pack — S31 Linux trên CO5300 AMOLED
++
++Cặp firmware trong checklist này là **PIO đã test trên board**:
++fix/co5300-speed-clean @ ab6cd0be1ff52c1baac86ac93629af7b88e7a33b.
++Ngày 2026-11-19: median 87667 us/frame, 3/5 mẫu dưới 100 ms, errors=0;
++vạch quét vẫn nhẹ. Bản DMA ở fix/co5300-gdma cần test riêng, xem
++[co5300-gdma.md](co5300-gdma.md).
++
++## 0. Source trước khi share
++
++Đã kiểm tra remote: main và fix/co5300-speed-clean đều ở ab6cd0b.
++Bản PIO đã vào main; bước merge đã đạt, không cần tạo merge lặp.
++
++Kiểm tra lại trên WSL trước khi đóng gói:
++
++~~~bash
++cd ~/s31-linux
++git fetch origin
++git merge-base --is-ancestor ab6cd0be1ff52c1baac86ac93629af7b88e7a33b origin/main
++~~~
++
++Exit 0 chứng minh main chứa revision PIO. Link source trong mô tả dùng
++commit cố định để vẫn khớp cặp binary khi main tiếp tục phát triển.
++Nếu sau này cần merge và gặp conflict, dừng merge và gửi log cho Rumi
++theo yêu cầu ban đầu; không force-push.
++
++## 1. Hai file và kiểm tra cặp binary
++
++Đường dẫn bản đã build trong WSL:
++
++~~~bash
++ls -lh build/coreboard1/flash.bin build/coreboard1/buildroot/sdcard.img
++~~~
++
++- flash.bin: kernel/loader, flash tại 0x0.
++- sdcard.img: USB rootfs, có /sbin/amoled-getty và đúng một getty tty0.
++- Board root trên USB; người nhận cần cả hai file.
++
++**Trạng thái trong server workspace khi làm checklist:** hai đường dẫn trên
++đều chưa có file; GitHub Releases chưa có asset. Vì vậy chưa kiểm tra checksum
++hay đóng gói binary thật, chưa upload Forge/Releases. Đã hỏi người dùng về
++đường dẫn hoặc link binary. Không dùng số đo PIO làm kết quả DMA.
++
++Helper scripts/prepare-amoled-share.py được cung cấp trong patch/nhánh DMA.
++Chạy nó trước build DMA ghi đè output PIO cũ. Nếu còn ở main PIO, tải riêng
++helper vào scripts/:
++
++~~~bash
++curl --fail --location \
++  https://raw.githubusercontent.com/pangcrd/esp32-s31-linux-amoled/fix/co5300-gdma/scripts/prepare-amoled-share.py \
++  -o scripts/prepare-amoled-share.py
++python3 scripts/prepare-amoled-share.py \
++  --kernel-build build/br-output-coreboard1-amoled/build/linux-7.3.4 \
++  --flash build/coreboard1/flash.bin \
++  --sdcard build/coreboard1/buildroot/sdcard.img \
++  --output build/share-co5300-pio
++~~~
++
++Chạy trên WSL host (Python/debugfs/e2fsprogs), không trên ESP32. Helper kiểm tra:
++
++- Các source kernel/SPI/framebuffer/clock/DT trong build tree khớp ab6cd0b.
++- Config AMOLED, kernel Image header RISC-V, và Image nằm trong flash.bin.
++- MBR/PARTUUID USB, nội dung wrapper/mode 0755 và một tty0 wrapper getty.
++- SHA256 hai file copy vào pack; không ghi đè artifact khác.
++
++Đây là kiểm tra consistency của build artifacts; helper không boot/test board
++hay chứng minh một build tái lập bit-for-bit. Metadata os-release được lưu
++nguyên trong manifest để xem phiên bản rootfs.
++
++Output:
++
++~~~text
++build/share-co5300-pio/
++  flash.bin
++  sdcard.img
++  SHA256SUMS
++  manifest.json
++  forge-description.txt
++~~~
++
++Helper đã qua kiểm tra với fixture ext4/MBR tổng hợp trên host, bao gồm việc
++từ chối source sai, kernel DMA hoặc flash không chứa Image. Fixture không phải
++binary firmware để phát hành.
++
++## 2. Đăng ESP Forge và USB image
++
++ESP Forge nhận một .bin để flash ở 0x0: upload flash.bin.
++Đặt sdcard.img ở download riêng, ví dụ GitHub Releases/Google Drive.
++Hai file cần cùng pack và SHA256SUMS; thêm link USB vào mô tả trước khi đăng.
++
++Sau khi có link chính xác của sdcard.img, tạo lại mô tả/manifest có link:
++
++~~~bash
++python3 scripts/prepare-amoled-share.py \
++  --kernel-build build/br-output-coreboard1-amoled/build/linux-7.3.4 \
++  --flash build/coreboard1/flash.bin \
++  --sdcard build/coreboard1/buildroot/sdcard.img \
++  --output build/share-co5300-pio \
++  --usb-url 'LINK_TAI_SDCARD_IMG'
++cat build/share-co5300-pio/forge-description.txt
++~~~
++
++Không upload mô tả còn [LINK_SDCARD_IMG]. Template ghi rõ PIO khoảng 87 ms,
++còn vạch quét nhẹ, DMA đang phát triển; source pin vào commit đã test.
++Việc upload chưa được thực hiện vì binary/link chưa có trong workspace.
++
++## 3. Người nhận
++
++1. Flash flash.bin tại 0x0 qua Forge/esptool.
++2. Ghi sdcard.img ra USB bằng balenaEtcher, cắm USB-A, cấp nguồn.
++
++Boot log kernel và login prompt hiện trên panel. SSH chỉ nhận key; người nhận
++thêm public key của họ vào /root/.ssh/authorized_keys qua serial.
++
++## DMA và tiêu chí phát hành tiếp theo
++
++Patch DMA không đổi getty/rootfs, nên board đang dùng rootfs PIO có thể
++test với flash.bin DMA. Acceptance DMA vẫn cần 5 mẫu thật và quan sát panel:
++cả 5 full_total_us dưới 100000, errors=0, không timeout, scroll/prompt đúng.
++Chưa ghi nhận acceptance DMA đạt và chưa chuẩn bị binary DMA để chia sẻ.
+diff --git a/linux/Documentation/ABI/testing/sysfs-driver-esp32s31-spi-dma b/linux/Documentation/ABI/testing/sysfs-driver-esp32s31-spi-dma
+new file mode 100644
+index 0000000..3297ad2
+--- /dev/null
++++ b/linux/Documentation/ABI/testing/sysfs-driver-esp32s31-spi-dma
+@@ -0,0 +1,15 @@
++What:		/sys/class/spi_master/spiN/device/dma_stats
++Date:		November 2026
++Description:
++		Read-only ESP32-S31 GPSPI DMA statistics. dma_available indicates
++		whether both DMA channels were obtained. dma_enabled reports the
++		current dma_enable parameter; mapped transfers already queued may
++		still finish with DMA after the parameter is disabled.
++
++		tx_transfers and tx_bytes count successful host TX scatter-gather
++		DMA transactions and pixel/data bytes. A 411640-byte frame uses
++		13 transactions because MS_DLEN is limited to 32768 bytes.
++		errors counts failures in that TX scatter-gather path. Legacy
++		target/RX/duplex bounce transfers are outside these counters.
++		The counters reset at probe; reading this file neither transfers
++		data nor writes to the framebuffer console.
+diff --git a/linux/Documentation/devicetree/bindings/dma/espressif,esp32s31-axi-gdma.yaml b/linux/Documentation/devicetree/bindings/dma/espressif,esp32s31-axi-gdma.yaml
+new file mode 100644
+index 0000000..7662772
+--- /dev/null
++++ b/linux/Documentation/devicetree/bindings/dma/espressif,esp32s31-axi-gdma.yaml
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/dma/espressif,esp32s31-axi-gdma.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Espressif ESP32-S31 AXI GDMA controller
++
++maintainers:
++  - pangcrd <pangcrd@users.noreply.github.com>
++
++description: |
++  Three independent receive/transmit channel pairs on the AXI bus. Descriptor
++  addresses are 8-byte aligned. The first DMA cell selects a directional
++  channel (RX0=0, TX0=1, RX1=2, TX1=3, RX2=4, TX2=5). The second selects the
++  peripheral (LCD/CAM=0, SPI2=1, SPI3=2, PARLIO=3, AES=4, SHA=5). One channel
++  per direction may connect to a given peripheral. GPIO-CS ownership remains
++  with the SPI controller and does not belong to this DMA controller.
++
++allOf:
++  - $ref: dma-controller.yaml#
++
++properties:
++  compatible:
++    const: espressif,esp32s31-axi-gdma
++  reg:
++    maxItems: 1
++  clocks:
++    maxItems: 1
++  resets:
++    maxItems: 1
++  interrupts:
++    minItems: 6
++    maxItems: 6
++  interrupt-names:
++    items:
++      - const: rx0
++      - const: tx0
++      - const: rx1
++      - const: tx1
++      - const: rx2
++      - const: tx2
++  "#dma-cells":
++    const: 2
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - resets
++  - interrupts
++  - interrupt-names
++  - "#dma-cells"
++
++unevaluatedProperties: false
++...
+diff --git a/linux/arch/riscv/boot/dts/espressif/esp32s31.dtsi b/linux/arch/riscv/boot/dts/espressif/esp32s31.dtsi
+index 0dbd895..454de05 100644
+--- a/linux/arch/riscv/boot/dts/espressif/esp32s31.dtsi
++++ b/linux/arch/riscv/boot/dts/espressif/esp32s31.dtsi
+@@ -323,6 +323,21 @@
+ 			status = "disabled";
+ 		};
+ 
++		axi_gdma: dma-controller@20348000 {
++			compatible = "espressif,esp32s31-axi-gdma";
++			reg = <0x20348000 0x2000>;
++			clocks = <&hp_clkrst ESP32S31_CLK_AXI_GDMA>;
++			resets = <&hp_clkrst ESP32S31_RST_AXI_GDMA>;
++			#dma-cells = <2>;
++			interrupt-parent = <&clic>;
++			/* CPU input, SoC source, type; IDF interrupt table 48..53. */
++			interrupts = <42 48 IRQ_TYPE_LEVEL_HIGH>, <43 51 IRQ_TYPE_LEVEL_HIGH>,
++				     <44 49 IRQ_TYPE_LEVEL_HIGH>, <45 52 IRQ_TYPE_LEVEL_HIGH>,
++				     <46 50 IRQ_TYPE_LEVEL_HIGH>, <47 53 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "rx0", "tx0", "rx1", "tx1", "rx2", "tx2";
++			status = "disabled";
++		};
++
+ 		gpspi2: spi@2038f000 {
+ 			compatible = "espressif,esp32s31-gpspi";
+ 			reg = <0x2038f000 0x1000>;
+diff --git a/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts b/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
+index e080aab..c2ee63a 100644
+--- a/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
++++ b/linux/arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts
+@@ -5,8 +5,16 @@
+  * Keep the supplier sequence and the working 40 MHz from the test log.
+  */
+ #include "esp32s31_coreboard1.dts"
++#include <dt-bindings/dma/espressif,esp32s31-axi-gdma.h>
++
++&axi_gdma {
++	status = "okay";
++};
+ 
+ &gpspi2 {
++	dmas = <&axi_gdma ESP32S31_GDMA_TX0 ESP32S31_GDMA_SPI2>,
++	       <&axi_gdma ESP32S31_GDMA_RX0 ESP32S31_GDMA_SPI2>;
++	dma-names = "tx", "rx";
+ 	espressif,gpio-cs-drive-strength = <20>;
+ 	/delete-node/ spidev@0;
+ 
+diff --git a/linux/drivers/clk/clk-esp32s31.c b/linux/drivers/clk/clk-esp32s31.c
+index c36fca0..29164ee 100644
+--- a/linux/drivers/clk/clk-esp32s31.c
++++ b/linux/drivers/clk/clk-esp32s31.c
+@@ -47,6 +47,8 @@
+ #define HP_GPSPI_MST_CLK_DIV_NUM		GENMASK(22, 15)
+ /* Bit number, not a mask: the gate API takes a bit index (see hp_init). */
+ #define HP_GPSPI_MST_CLK_EN		23
++#define HP_AXI_PDMA_CTRL0		0x78
++#define HP_AXI_PDMA_FORCE_NORST		BIT(2)
+ #define HP_RMT_CTRL0			0xbc
+ #define HP_SDIO_HOST_CTRL0		0xc0
+ #define HP_SDIO_LS_CLK_EN		3
+@@ -365,6 +367,16 @@ static int esp32s31_hp_init(struct esp32s31_clk *ec)
+ 						    ec->base + HP_GPSPI2_CTRL0,
+ 						    HP_GPSPI_MST_CLK_EN, 0,
+ 						    &ec->lock);
++	/* AXI GDMA gate/reset, matched to S31 IDF gdma_ll.h.
++	 * The optional IDF LCD can use this clock when Linux GDMA is disabled.
++	 */
++	writel(readl(ec->base + HP_AXI_PDMA_CTRL0) & ~HP_AXI_PDMA_FORCE_NORST,
++	       ec->base + HP_AXI_PDMA_CTRL0);
++	hws[ESP32S31_CLK_AXI_GDMA] =
++		devm_clk_hw_register_gate_parent_hw(ec->dev, "axi-gdma",
++						    hws[ESP32S31_CLK_SYS], CLK_IGNORE_UNUSED,
++						    ec->base + HP_AXI_PDMA_CTRL0,
++						    0, 0, &ec->lock);
+ 	return 0;
+ }
+ 
+@@ -525,10 +537,11 @@ static const struct esp32s31_reset esp32s31_hp_resets[] = {
+ 	[ESP32S31_RST_RMT] = { HP_RMT_CTRL0, HP_PERIPH_RST_EN },
+ 	/* Reset is bit 2 of HP_GPSPI2_CTRL0, not bit 1 like I2C/RMT. */
+ 	[ESP32S31_RST_GPSPI2] = { HP_GPSPI2_CTRL0, HP_GPSPI_RST_EN },
++	[ESP32S31_RST_AXI_GDMA] = { HP_AXI_PDMA_CTRL0, HP_PERIPH_RST_EN },
+ };
+ 
+ static const struct esp32s31_clk_data esp32s31_hp_data = {
+-	.nclks = ESP32S31_CLK_GPSPI2 + 1,
++	.nclks = ESP32S31_CLK_AXI_GDMA + 1,
+ 	.init = esp32s31_hp_init,
+ 	.resets = esp32s31_hp_resets,
+ 	.nresets = ARRAY_SIZE(esp32s31_hp_resets),
+diff --git a/linux/drivers/dma/esp32s31-axi-gdma.c b/linux/drivers/dma/esp32s31-axi-gdma.c
+new file mode 100644
+index 0000000..1e07aff
+--- /dev/null
++++ b/linux/drivers/dma/esp32s31-axi-gdma.c
+@@ -0,0 +1,566 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * ESP32-S31 AXI GDMA slave-SG support.
++ *
++ * Register layout and slave-SG model adapted from GrieferPig/linux-esp32-s31
++ * 2bf05bc5f379066cf5f64d750afbb0b4ba0bf364. Each RX/TX half is an independent
++ * Linux channel, as specified by ESP32-S31 TRM Pre-release v0.2, chapter 3.
++ * Hardware descriptors live in Linux's coherent SRAM pool; payload addresses
++ * come from the client's DMA mapping and may refer to non-coherent PSRAM.
++ */
++#include <linux/bitfield.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmapool.h>
++#include <linux/dmaengine.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of_dma.h>
++#include <linux/platform_device.h>
++#include <linux/reset.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/sizes.h>
++
++#include "virt-dma.h"
++
++#define S31_AXI_CHANNELS	6
++#define S31_AXI_DESC_MAX		4032U /* <= 4095, multiple of PSRAM cache line */
++#define S31_AXI_RX_BASE(n)	((n) * 0x68)
++#define S31_AXI_TX_BASE(n)	(0x138 + (n) * 0x68)
++#define S31_AXI_INT_ST		0x04
++#define S31_AXI_INT_ENA		0x08
++#define S31_AXI_INT_CLR		0x0c
++#define S31_AXI_CONF0		0x10
++#define S31_AXI_CONF1		0x14
++#define S31_AXI_LINK1		0x20
++#define S31_AXI_LINK2		0x24
++#define S31_AXI_EOF_DESC		0x2c
++#define S31_AXI_PERI_SEL		0x44
++#define S31_AXI_RST		BIT(0)
++#define S31_AXI_OWNER_CHECK	BIT(12)
++#define S31_AXI_TX_AUTO_WRBACK	BIT(2)
++#define S31_AXI_TX_EOF_POPPED	BIT(3)
++#define S31_AXI_TX_BURST		GENMASK(7, 5)
++#define S31_AXI_TX_ABORT		BIT(8)
++#define S31_AXI_TX_DESC_BURST	BIT(10)
++#define S31_AXI_RX_BURST		GENMASK(6, 4)
++#define S31_AXI_RX_ABORT		BIT(7)
++#define S31_AXI_RX_DESC_BURST	BIT(9)
++#define S31_AXI_TX_STOP		BIT(0)
++#define S31_AXI_TX_START		BIT(1)
++#define S31_AXI_RX_STOP		BIT(1)
++#define S31_AXI_RX_START		BIT(2)
++#define S31_AXI_TX_EOF		BIT(1)
++#define S31_AXI_TX_TOTAL_EOF	BIT(3)
++#define S31_AXI_TX_ERRORS	(BIT(2) | BIT(4) | BIT(5))
++#define S31_AXI_RX_EOF		BIT(1)
++#define S31_AXI_RX_ERRORS	GENMASK(6, 2)
++#define S31_AXI_RX_RESET_AVAIL(n) (0x28c + (n) * 4)
++#define S31_AXI_TX_RESET_AVAIL(n) (0x298 + (n) * 4)
++#define S31_AXI_INTR_START	0x27c
++#define S31_AXI_INTR_END		0x280
++#define S31_AXI_EXTR_START	0x284
++#define S31_AXI_EXTR_END		0x288
++#define S31_AXI_MISC		0x2a8
++#define S31_AXI_MISC_CLK		BIT(4)
++#define S31_AXI_DESC_SIZE	GENMASK(11, 0)
++#define S31_AXI_DESC_LENGTH	GENMASK(23, 12)
++#define S31_AXI_DESC_EOF		BIT(30)
++#define S31_AXI_DESC_OWNER	BIT(31)
++
++struct s31_axi_hw_desc {
++	__le32 control, buffer, next, padding;
++} __aligned(8);
++
++struct s31_axi_node {
++	struct s31_axi_hw_desc *hw;
++	dma_addr_t dma;
++};
++
++struct s31_axi_desc {
++	struct virt_dma_desc vd;
++	size_t len;
++	unsigned int count;
++	struct s31_axi_node nodes[];
++};
++
++struct s31_axi_dma;
++struct s31_axi_chan {
++	struct virt_dma_chan vc;
++	struct s31_axi_dma *dma;
++	struct s31_axi_desc *active;
++	struct dma_slave_config config;
++	dma_cookie_t error_cookie;
++	u32 periph;
++	unsigned int id;
++	bool tx;
++	int irq;
++};
++
++struct s31_axi_dma {
++	struct dma_device device;
++	void __iomem *base;
++	struct dma_pool *pool;
++	/* Serialize directional channel/peripheral reservations. */
++	spinlock_t request_lock;
++	struct s31_axi_chan channels[S31_AXI_CHANNELS];
++};
++
++static struct s31_axi_chan *s31_axi_chan(struct dma_chan *chan)
++{
++	return container_of(chan, struct s31_axi_chan, vc.chan);
++}
++
++static struct s31_axi_desc *s31_axi_desc(struct virt_dma_desc *vd)
++{
++	return container_of(vd, struct s31_axi_desc, vd);
++}
++
++static void __iomem *s31_axi_reg(struct s31_axi_chan *ch, u32 reg)
++{
++	u32 base = ch->tx ? S31_AXI_TX_BASE(ch->id) : S31_AXI_RX_BASE(ch->id);
++
++	return ch->dma->base + base + reg;
++}
++
++static void s31_axi_free_desc(struct virt_dma_desc *vd)
++{
++	struct s31_axi_desc *desc = s31_axi_desc(vd);
++	struct s31_axi_chan *ch = s31_axi_chan(vd->tx.chan);
++	unsigned int i;
++
++	for (i = 0; i < desc->count; i++)
++		dma_pool_free(ch->dma->pool, desc->nodes[i].hw, desc->nodes[i].dma);
++	kfree(desc);
++}
++
++/* Called with vc.lock held. Abort bus requests before resetting/freeing LLIs. */
++static int s31_axi_stop(struct s31_axi_chan *ch)
++{
++	u32 val, conf = readl(s31_axi_reg(ch, S31_AXI_CONF0));
++	u32 avail = ch->tx ? S31_AXI_TX_RESET_AVAIL(ch->id) :
++			    S31_AXI_RX_RESET_AVAIL(ch->id);
++
++	writel(0, s31_axi_reg(ch, S31_AXI_INT_ENA));
++	writel(conf | (ch->tx ? S31_AXI_TX_ABORT : S31_AXI_RX_ABORT),
++	       s31_axi_reg(ch, S31_AXI_CONF0));
++	writel(ch->tx ? S31_AXI_TX_STOP : S31_AXI_RX_STOP,
++	       s31_axi_reg(ch, S31_AXI_LINK1));
++	if (readl_poll_timeout(ch->dma->base + avail, val, val & BIT(0), 0, 1000)) {
++		dev_err_ratelimited(ch->dma->device.dev, "%s%u reset unavailable\n",
++				    ch->tx ? "tx" : "rx", ch->id);
++		return -ETIMEDOUT;
++	}
++	writel(conf | S31_AXI_RST, s31_axi_reg(ch, S31_AXI_CONF0));
++	writel(conf & ~S31_AXI_RST, s31_axi_reg(ch, S31_AXI_CONF0));
++	writel(~0U, s31_axi_reg(ch, S31_AXI_INT_CLR));
++	return 0;
++}
++
++static void s31_axi_start(struct s31_axi_chan *ch)
++{
++	struct virt_dma_desc *vd;
++	u32 conf, burst, mask;
++
++	lockdep_assert_held(&ch->vc.lock);
++	if (ch->active)
++		return;
++	vd = vchan_next_desc(&ch->vc);
++	if (!vd)
++		return;
++	list_del(&vd->node);
++	ch->active = s31_axi_desc(vd);
++	/* 32-byte memory bursts (4 AXI beats), below the PSRAM 128-byte limit. */
++	burst = 2;
++	conf = ch->tx ? S31_AXI_TX_AUTO_WRBACK | S31_AXI_TX_EOF_POPPED |
++		       S31_AXI_TX_DESC_BURST | FIELD_PREP(S31_AXI_TX_BURST, burst) :
++		       S31_AXI_RX_DESC_BURST | FIELD_PREP(S31_AXI_RX_BURST, burst);
++	writel(conf | S31_AXI_RST, s31_axi_reg(ch, S31_AXI_CONF0));
++	writel(conf, s31_axi_reg(ch, S31_AXI_CONF0));
++	writel(S31_AXI_OWNER_CHECK, s31_axi_reg(ch, S31_AXI_CONF1));
++	writel(ch->periph, s31_axi_reg(ch, S31_AXI_PERI_SEL));
++	writel(~0U, s31_axi_reg(ch, S31_AXI_INT_CLR));
++	mask = ch->tx ? S31_AXI_TX_TOTAL_EOF | S31_AXI_TX_ERRORS :
++		       S31_AXI_RX_EOF | S31_AXI_RX_ERRORS;
++	dma_wmb();
++	writel(lower_32_bits(ch->active->nodes[0].dma),
++	       s31_axi_reg(ch, S31_AXI_LINK2));
++	writel(mask, s31_axi_reg(ch, S31_AXI_INT_ENA));
++	writel(ch->tx ? S31_AXI_TX_START : S31_AXI_RX_START,
++	       s31_axi_reg(ch, S31_AXI_LINK1));
++}
++
++static bool s31_axi_valid_address(dma_addr_t addr, size_t len)
++{
++	if (!len || upper_32_bits(addr) || len - 1 > U32_MAX - addr)
++		return false;
++	/* Default address windows in S31 AXI GDMA LL; no peripheral pointers. */
++	return (addr >= 0x2f000000 && addr + len - 1 <= 0x2f07ffff) ||
++	       (addr >= 0x40000000 && addr + len - 1 <= 0x53ffffff);
++}
++
++static struct dma_async_tx_descriptor *
++s31_axi_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
++		      unsigned int nents, enum dma_transfer_direction dir,
++		      unsigned long flags, void *context)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++	struct s31_axi_desc *desc;
++	struct scatterlist *sg;
++	unsigned int capacity = 0, i, n = 0;
++	size_t total = 0;
++
++	if (!nents || ch->periph > 5 ||
++	    dir != (ch->tx ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM))
++		return NULL;
++	for_each_sg(sgl, sg, nents, i) {
++		size_t len = sg_dma_len(sg);
++
++		if (!s31_axi_valid_address(sg_dma_address(sg), len) ||
++		    len > SZ_512K || total > SZ_512K - len)
++			return NULL;
++		total += len;
++		capacity += DIV_ROUND_UP(len, S31_AXI_DESC_MAX);
++	}
++	desc = kzalloc(struct_size(desc, nodes, capacity), GFP_NOWAIT);
++	if (!desc)
++		return NULL;
++	desc->vd.tx.chan = chan; /* Free the partially allocated list on errors. */
++	desc->len = total;
++	for_each_sg(sgl, sg, nents, i) {
++		dma_addr_t addr = sg_dma_address(sg);
++		size_t len = sg_dma_len(sg);
++
++		while (len) {
++			struct s31_axi_node *node = &desc->nodes[n];
++			u32 chunk = min_t(size_t, len, S31_AXI_DESC_MAX);
++			u32 ctrl = FIELD_PREP(S31_AXI_DESC_SIZE, chunk) | S31_AXI_DESC_OWNER;
++
++			node->hw = dma_pool_zalloc(ch->dma->pool, GFP_NOWAIT, &node->dma);
++			if (!node->hw)
++				goto fail;
++			desc->count = ++n;
++			if (ch->tx)
++				ctrl |= FIELD_PREP(S31_AXI_DESC_LENGTH, chunk);
++			node->hw->control = cpu_to_le32(ctrl);
++			node->hw->buffer = cpu_to_le32(lower_32_bits(addr));
++			if (n > 1)
++				desc->nodes[n - 2].hw->next = cpu_to_le32(lower_32_bits(node->dma));
++			addr += chunk;
++			len -= chunk;
++		}
++	}
++	if (ch->tx)
++		desc->nodes[n - 1].hw->control |= cpu_to_le32(S31_AXI_DESC_EOF);
++	return vchan_tx_prep(&ch->vc, &desc->vd, flags);
++fail:
++	s31_axi_free_desc(&desc->vd);
++	return NULL;
++}
++
++static int s31_axi_config(struct dma_chan *chan, struct dma_slave_config *config)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++
++	if (config->direction != (ch->tx ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM) ||
++	    config->src_addr_width != DMA_SLAVE_BUSWIDTH_4_BYTES ||
++	    config->dst_addr_width != DMA_SLAVE_BUSWIDTH_4_BYTES ||
++	    config->device_fc)
++		return -EINVAL;
++	ch->config = *config;
++	return 0;
++}
++
++static void s31_axi_issue_pending(struct dma_chan *chan)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++	unsigned long flags;
++
++	spin_lock_irqsave(&ch->vc.lock, flags);
++	if (vchan_issue_pending(&ch->vc))
++		s31_axi_start(ch);
++	spin_unlock_irqrestore(&ch->vc.lock, flags);
++}
++
++static irqreturn_t s31_axi_irq(int irq, void *arg)
++{
++	struct s31_axi_chan *ch = arg;
++	struct s31_axi_desc *desc;
++	unsigned long flags;
++	u32 status, errors;
++	int ret;
++
++	spin_lock_irqsave(&ch->vc.lock, flags);
++	status = readl(s31_axi_reg(ch, S31_AXI_INT_ST));
++	if (!status) {
++		spin_unlock_irqrestore(&ch->vc.lock, flags);
++		return IRQ_NONE;
++	}
++	writel(status, s31_axi_reg(ch, S31_AXI_INT_CLR));
++	desc = ch->active;
++	if (!desc) {
++		spin_unlock_irqrestore(&ch->vc.lock, flags);
++		return IRQ_HANDLED;
++	}
++	errors = status & (ch->tx ? S31_AXI_TX_ERRORS : S31_AXI_RX_ERRORS);
++	ret = s31_axi_stop(ch);
++	if (ret) {
++		spin_unlock_irqrestore(&ch->vc.lock, flags);
++		return IRQ_HANDLED; /* Retain DMA-owned descriptors until termination. */
++	}
++	ch->active = NULL;
++	if (errors) {
++		ch->error_cookie = desc->vd.tx.cookie;
++		desc->vd.tx_result.result = ch->tx ? DMA_TRANS_READ_FAILED : DMA_TRANS_WRITE_FAILED;
++		desc->vd.tx_result.residue = desc->len;
++		dev_err_ratelimited(ch->dma->device.dev, "%s%u DMA error status=%#x\n",
++				    ch->tx ? "tx" : "rx", ch->id, status);
++	}
++	vchan_cookie_complete(&desc->vd);
++	s31_axi_start(ch);
++	spin_unlock_irqrestore(&ch->vc.lock, flags);
++	return IRQ_HANDLED;
++}
++
++static enum dma_status s31_axi_tx_status(struct dma_chan *chan,
++					 dma_cookie_t cookie, struct dma_tx_state *state)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++	enum dma_status status = dma_cookie_status(chan, cookie, state);
++	unsigned long flags;
++	struct virt_dma_desc *vd;
++
++	spin_lock_irqsave(&ch->vc.lock, flags);
++	if (cookie == ch->error_cookie) {
++		status = DMA_ERROR;
++	} else if (status != DMA_COMPLETE && state) {
++		vd = vchan_find_desc(&ch->vc, cookie);
++		if (ch->active && ch->active->vd.tx.cookie == cookie)
++			dma_set_residue(state, ch->active->len);
++		else if (vd)
++			dma_set_residue(state, s31_axi_desc(vd)->len);
++	}
++	spin_unlock_irqrestore(&ch->vc.lock, flags);
++	return status;
++}
++
++static int s31_axi_terminate_all(struct dma_chan *chan)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++	unsigned long flags;
++	int ret;
++	LIST_HEAD(head);
++
++	spin_lock_irqsave(&ch->vc.lock, flags);
++	ret = s31_axi_stop(ch);
++	if (!ret) {
++		if (ch->active) {
++			vchan_terminate_vdesc(&ch->active->vd);
++			ch->active = NULL;
++		}
++		vchan_get_all_descriptors(&ch->vc, &head);
++	}
++	spin_unlock_irqrestore(&ch->vc.lock, flags);
++	vchan_dma_desc_free_list(&ch->vc, &head);
++	return ret;
++}
++
++static void s31_axi_synchronize(struct dma_chan *chan)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++
++	synchronize_irq(ch->irq);
++	vchan_synchronize(&ch->vc);
++}
++
++static int s31_axi_alloc_chan(struct dma_chan *chan)
++{
++	dma_cookie_init(chan);
++	s31_axi_chan(chan)->error_cookie = -EBUSY;
++	return 0;
++}
++
++static void s31_axi_free_chan(struct dma_chan *chan)
++{
++	struct s31_axi_chan *ch = s31_axi_chan(chan);
++
++	if (s31_axi_terminate_all(chan))
++		return;
++	s31_axi_synchronize(chan);
++	vchan_free_chan_resources(&ch->vc);
++	writel(0x3f, s31_axi_reg(ch, S31_AXI_PERI_SEL));
++	spin_lock_irq(&ch->dma->request_lock);
++	ch->periph = U32_MAX;
++	spin_unlock_irq(&ch->dma->request_lock);
++}
++
++static struct dma_chan *s31_axi_xlate(struct of_phandle_args *args, struct of_dma *ofdma)
++{
++	struct s31_axi_dma *dma = ofdma->of_dma_data;
++	struct s31_axi_chan *ch;
++	struct dma_chan *chan;
++	unsigned long flags;
++	unsigned int i;
++
++	if (args->args_count != 2 || args->args[0] >= S31_AXI_CHANNELS || args->args[1] > 5)
++		return NULL;
++	ch = &dma->channels[args->args[0]];
++	spin_lock_irqsave(&dma->request_lock, flags);
++	if (ch->periph != U32_MAX)
++		goto busy;
++	/* TRM: a peripheral can have only one channel per direction. */
++	for (i = 0; i < S31_AXI_CHANNELS; i++)
++		if (dma->channels[i].tx == ch->tx && dma->channels[i].periph == args->args[1])
++			goto busy;
++	ch->periph = args->args[1];
++	spin_unlock_irqrestore(&dma->request_lock, flags);
++	chan = dma_get_slave_channel(&ch->vc.chan);
++	if (!chan) {
++		spin_lock_irqsave(&dma->request_lock, flags);
++		ch->periph = U32_MAX;
++		spin_unlock_irqrestore(&dma->request_lock, flags);
++	}
++	return chan;
++busy:
++	spin_unlock_irqrestore(&dma->request_lock, flags);
++	return NULL;
++}
++
++static int s31_axi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct s31_axi_dma *dma;
++	struct reset_control *rst;
++	struct clk *clk;
++	unsigned int i;
++	int ret;
++
++	dma = devm_kzalloc(dev, sizeof(*dma), GFP_KERNEL);
++	if (!dma)
++		return -ENOMEM;
++	dma->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(dma->base))
++		return PTR_ERR(dma->base);
++	clk = devm_clk_get_enabled(dev, NULL);
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk), "bus clock unavailable\n");
++	rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(rst))
++		return dev_err_probe(dev, PTR_ERR(rst), "reset unavailable\n");
++	ret = reset_control_assert(rst);
++	if (ret)
++		return ret;
++	ret = reset_control_deassert(rst);
++	if (ret)
++		return ret;
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	dma->pool = dma_pool_create("esp32s31-axi-desc", dev,
++				    sizeof(struct s31_axi_hw_desc), 8, 0);
++	if (!dma->pool)
++		return -ENOMEM;
++	spin_lock_init(&dma->request_lock);
++	dma->device.dev = dev;
++	INIT_LIST_HEAD(&dma->device.channels);
++	dma_cap_set(DMA_SLAVE, dma->device.cap_mask);
++	dma->device.directions = BIT(DMA_MEM_TO_DEV) | BIT(DMA_DEV_TO_MEM);
++	dma->device.src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
++	dma->device.dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
++	dma->device.residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
++	dma->device.device_alloc_chan_resources = s31_axi_alloc_chan;
++	dma->device.device_free_chan_resources = s31_axi_free_chan;
++	dma->device.device_config = s31_axi_config;
++	dma->device.device_prep_slave_sg = s31_axi_prep_slave_sg;
++	dma->device.device_issue_pending = s31_axi_issue_pending;
++	dma->device.device_tx_status = s31_axi_tx_status;
++	dma->device.device_terminate_all = s31_axi_terminate_all;
++	dma->device.device_synchronize = s31_axi_synchronize;
++
++	writel(0x2f000000, dma->base + S31_AXI_INTR_START);
++	writel(0x2f07ffff, dma->base + S31_AXI_INTR_END);
++	writel(0x40000000, dma->base + S31_AXI_EXTR_START);
++	writel(0x53ffffff, dma->base + S31_AXI_EXTR_END);
++	writel(S31_AXI_MISC_CLK, dma->base + S31_AXI_MISC);
++	for (i = 0; i < S31_AXI_CHANNELS; i++) {
++		struct s31_axi_chan *ch = &dma->channels[i];
++		char name[8];
++
++		ch->dma = dma;
++		ch->id = i / 2;
++		ch->tx = i & 1;
++		ch->periph = U32_MAX;
++		ch->error_cookie = -EBUSY;
++		ch->vc.desc_free = s31_axi_free_desc;
++		vchan_init(&ch->vc, &dma->device);
++		writel(0, s31_axi_reg(ch, S31_AXI_INT_ENA));
++		writel(~0U, s31_axi_reg(ch, S31_AXI_INT_CLR));
++		writel(0x3f, s31_axi_reg(ch, S31_AXI_PERI_SEL));
++		snprintf(name, sizeof(name), "%s%u", ch->tx ? "tx" : "rx", ch->id);
++		ch->irq = platform_get_irq_byname(pdev, name);
++		if (ch->irq < 0) {
++			ret = ch->irq;
++			goto fail;
++		}
++		ret = devm_request_irq(dev, ch->irq, s31_axi_irq, 0, dev_name(dev), ch);
++		if (ret)
++			goto fail;
++	}
++	ret = dma_async_device_register(&dma->device);
++	if (ret)
++		goto fail;
++	ret = of_dma_controller_register(dev->of_node, s31_axi_xlate, dma);
++	if (ret) {
++		dma_async_device_unregister(&dma->device);
++		goto fail;
++	}
++	platform_set_drvdata(pdev, dma);
++	dev_info(dev, "AXI GDMA ready: 3 independent TX/RX pairs, slave-SG, SRAM descriptors\n");
++	return 0;
++fail:
++	/* Only the first i+1 vchans were initialized if IRQ setup failed. */
++	for (i = 0; i < S31_AXI_CHANNELS; i++)
++		if (dma->channels[i].vc.desc_free)
++			tasklet_kill(&dma->channels[i].vc.task);
++	dma_pool_destroy(dma->pool);
++	return ret;
++}
++
++static void s31_axi_remove(struct platform_device *pdev)
++{
++	struct s31_axi_dma *dma = platform_get_drvdata(pdev);
++	unsigned int i;
++
++	of_dma_controller_free(pdev->dev.of_node);
++	dma_async_device_unregister(&dma->device);
++	for (i = 0; i < S31_AXI_CHANNELS; i++) {
++		if (s31_axi_terminate_all(&dma->channels[i].vc.chan)) {
++			dev_err(&pdev->dev, "DMA still owns descriptors; retaining pool\n");
++			return;
++		}
++		s31_axi_synchronize(&dma->channels[i].vc.chan);
++		vchan_free_chan_resources(&dma->channels[i].vc);
++	}
++	dma_pool_destroy(dma->pool);
++}
++
++static const struct of_device_id s31_axi_match[] = {
++	{ .compatible = "espressif,esp32s31-axi-gdma" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, s31_axi_match);
++
++static struct platform_driver s31_axi_driver = {
++	.probe = s31_axi_probe,
++	.remove = s31_axi_remove,
++	.driver = {
++		.name = "esp32s31-axi-gdma",
++		.of_match_table = s31_axi_match,
++	},
++};
++module_platform_driver(s31_axi_driver);
++MODULE_DESCRIPTION("ESP32-S31 AXI GDMA slave-SG controller");
++MODULE_LICENSE("GPL");
+diff --git a/linux/drivers/spi/spi-esp32s31.c b/linux/drivers/spi/spi-esp32s31.c
+index 6adfe13..e44671a 100644
+--- a/linux/drivers/spi/spi-esp32s31.c
++++ b/linux/drivers/spi/spi-esp32s31.c
+@@ -8,6 +8,7 @@
+  * ARCH_ESPRESSIF.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/completion.h>
+@@ -24,6 +25,12 @@
+ #include <linux/spi/spi.h>
+ 
+ #define S31_SPI_FIFO_SIZE	64
++/* MS_DATA_BITLEN is 18 bits: at most 262144 bits per DMA transaction. */
++#define S31_SPI_DMA_MAX		SZ_32K
++
++static bool dma_enable = true;
++module_param(dma_enable, bool, 0644);
++MODULE_PARM_DESC(dma_enable, "Use DMA when channels are present; N selects PIO");
+ 
+ /* Short high-speed FIFO transactions complete sooner than an IRQ round trip. */
+ static bool pio_poll = true;
+@@ -111,6 +118,7 @@ struct esp32s31_spi {
+ 	u32 max_data_lines;
+ 	u32 gpio_cs_drive_strength;
+ 	int irq;
++	atomic64_t dma_tx_transfers, dma_tx_bytes, dma_errors;
+ 	bool target;
+ 	bool polling;
+ 	bool target_aborted;
+@@ -160,8 +168,8 @@ static size_t esp32s31_spi_max_transfer_size(struct spi_device *spi)
+ 
+ 	if (s->target && !s->rx_dma)
+ 		return S31_SPI_FIFO_SIZE;
+-	/* DMA bounce buffers are 4 KiB; PIO can stream a whole framebuffer. */
+-	return s->tx_dma ? SZ_4K : SZ_512K;
++	/* Host SG DMA is bounded by MS_DLEN; target bounce buffers remain 4 KiB. */
++	return s->tx_dma ? (s->target ? SZ_4K : S31_SPI_DMA_MAX) : SZ_512K;
+ }
+ 
+ static void esp32s31_spi_target_reset(struct esp32s31_spi *s)
+@@ -437,7 +445,7 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
+ 	writel(~0U, s->base + S31_SPI_INT_CLR);
+ 	writel(S31_SPI_CMD_UPDATE, s->base + S31_SPI_CMD);
+ 	if (readl_poll_timeout(s->base + S31_SPI_CMD, cmd,
+-			       !(cmd & S31_SPI_CMD_UPDATE), 1, 1000))
++			       !(cmd & S31_SPI_CMD_UPDATE), 0, 1000))
+ 		return esp32s31_spi_transaction_error(s, "UPDATE");
+ 
+ 	if (!s->polling)
+@@ -464,7 +472,7 @@ static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,
+ 	writel(0, s->base + S31_SPI_INT_ENA);
+ 	/* The IRQ can precede CMD.USR falling. Keep GPIO CS low until idle. */
+ 	if (readl_poll_timeout(s->base + S31_SPI_CMD, cmd,
+-			       !(cmd & S31_SPI_CMD_USR), 1, 100000))
++			       !(cmd & S31_SPI_CMD_USR), 0, 100000))
+ 		return esp32s31_spi_transaction_error(s, "USR");
+ 	writel(S31_SPI_TRANS_DONE, s->base + S31_SPI_INT_CLR);
+ 	return 0;
+@@ -501,6 +509,97 @@ static void esp32s31_spi_dma_complete(void *data)
+ 	complete(data);
+ }
+ 
++static bool esp32s31_spi_can_dma(struct spi_controller *ctlr,
++				 struct spi_device *spi, struct spi_transfer *xfer)
++{
++	struct esp32s31_spi *s = spi_controller_get_devdata(ctlr);
++
++	return !s->target && s->tx_dma && s->rx_dma && READ_ONCE(dma_enable) &&
++	       xfer->tx_buf && !xfer->rx_buf && xfer->len > S31_SPI_FIFO_SIZE &&
++	       IS_ALIGNED((unsigned long)xfer->tx_buf, 4);
++}
++
++/* SPI core maps vmalloc pixels page by page and performs PSRAM cache sync. */
++static int esp32s31_spi_dma_tx_sg(struct esp32s31_spi *s,
++				  struct spi_controller *ctlr,
++				  struct spi_transfer *xfer, u32 misc)
++{
++	struct dma_slave_config config = {
++		.direction = DMA_MEM_TO_DEV,
++		.src_addr = s->fifo_addr, .dst_addr = s->fifo_addr,
++		.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
++		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
++		.src_maxburst = 8, .dst_maxburst = 8,
++	};
++	struct dma_async_tx_descriptor *desc;
++	dma_cookie_t cookie;
++	unsigned int timeout_ms = spi_controller_xfer_timeout(ctlr, xfer);
++	u32 conf, raw;
++	int ret;
++
++	if (!xfer->tx_sg.nents || xfer->len > S31_SPI_DMA_MAX)
++		return -EINVAL;
++	ret = dmaengine_slave_config(s->tx_dma, &config);
++	if (ret)
++		goto error;
++	desc = dmaengine_prep_slave_sg(s->tx_dma, xfer->tx_sg.sgl, xfer->tx_sg.nents,
++				       DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!desc) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	reinit_completion(&s->dma_tx_done);
++	desc->callback = esp32s31_spi_dma_complete;
++	desc->callback_param = &s->dma_tx_done;
++	cookie = dmaengine_submit(desc);
++	ret = dma_submit_error(cookie);
++	if (ret)
++		goto terminate;
++	conf = readl(s->base + S31_SPI_DMA_CONF) &
++	       ~(S31_SPI_DMA_TX_EN | S31_SPI_DMA_RX_EN);
++	/* Same TX DMA FIFO reset and enable sequence as the pinned IDF LL. */
++	writel(conf | S31_SPI_DMA_AFIFO_RST, s->base + S31_SPI_DMA_CONF);
++	writel(conf, s->base + S31_SPI_DMA_CONF);
++	writel(S31_SPI_MST_RX_AFIFO_WFULL_ERR | S31_SPI_MST_TX_AFIFO_REMPTY_ERR,
++	       s->base + S31_SPI_INT_CLR);
++	writel(conf | S31_SPI_DMA_TX_EN, s->base + S31_SPI_DMA_CONF);
++	writel(misc, s->base + S31_SPI_MISC);
++	writel(xfer->len * 8 - 1, s->base + S31_SPI_MS_DLEN);
++	dma_async_issue_pending(s->tx_dma);
++	ret = esp32s31_spi_wait_transaction(s, timeout_ms);
++	if (ret)
++		goto stop;
++	if (!wait_for_completion_timeout(&s->dma_tx_done, msecs_to_jiffies(timeout_ms))) {
++		ret = -ETIMEDOUT;
++		goto stop;
++	}
++	if (dma_async_is_tx_complete(s->tx_dma, cookie, NULL, NULL) != DMA_COMPLETE) {
++		ret = -EIO;
++		goto stop;
++	}
++	raw = readl(s->base + S31_SPI_INT_RAW);
++	if (raw & (S31_SPI_MST_RX_AFIFO_WFULL_ERR | S31_SPI_MST_TX_AFIFO_REMPTY_ERR)) {
++		ret = -EIO;
++		goto stop;
++	}
++	writel(conf, s->base + S31_SPI_DMA_CONF);
++	atomic64_inc(&s->dma_tx_transfers);
++	atomic64_add(xfer->len, &s->dma_tx_bytes);
++	return 0;
++stop:
++	writel(0, s->base + S31_SPI_INT_ENA);
++	synchronize_irq(s->irq);
++	/* Stop GPSPI before terminating DMA and before core releases CS/unmaps SG. */
++	esp32s31_spi_target_reset(s);
++	writel(conf, s->base + S31_SPI_DMA_CONF);
++terminate:
++	dmaengine_terminate_sync(s->tx_dma);
++error:
++	atomic64_inc(&s->dma_errors);
++	dev_err_ratelimited(s->dev, "TX SG DMA failed: %d, length=%u\n", ret, xfer->len);
++	return ret;
++}
++
+ static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s,
+ 				     struct spi_controller *ctlr,
+ 				     struct spi_transfer *xfer, u32 misc)
+@@ -786,10 +885,17 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
+ 		misc |= BIT(cs + 7);
+ 	if (spi->mode & SPI_CPOL)
+ 		misc |= S31_SPI_CK_IDLE_EDGE;
+-	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
++	if (!gpio_cs && !xfer->cs_change && !spi_transfer_is_last(ctlr, xfer))
++		misc |= S31_SPI_CS_KEEP_ACTIVE;
++	/* Route mapped TX by the mapping, even if dma_enable changes mid-message. */
++	if (xfer->tx_buf && !xfer->rx_buf && xfer->tx_sg_mapped)
++		return esp32s31_spi_dma_tx_sg(s, ctlr, xfer, misc);
++	if (READ_ONCE(dma_enable) && s->tx_dma && s->rx_dma &&
++	    xfer->len > S31_SPI_FIFO_SIZE && xfer->len <= SZ_4K &&
+ 	    (!!xfer->tx_buf != !!xfer->rx_buf))
+ 		return esp32s31_spi_dma_transfer(s, ctlr, xfer, misc);
+-	if (s->tx_dma && s->rx_dma && xfer->len > S31_SPI_FIFO_SIZE &&
++	if (READ_ONCE(dma_enable) && s->tx_dma && s->rx_dma &&
++	    xfer->len > S31_SPI_FIFO_SIZE && xfer->len <= SZ_4K &&
+ 	    xfer->tx_buf && xfer->rx_buf)
+ 		return esp32s31_spi_dma_duplex_transfer(s, ctlr, xfer, misc);
+ 
+@@ -878,6 +984,25 @@ static void esp32s31_spi_free_dma_buffer(void *data)
+ 				     s->rx_dma_addr, DMA_FROM_DEVICE);
+ }
+ 
++static ssize_t dma_stats_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct esp32s31_spi *s = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf,
++		"dma_available=%c dma_enabled=%c tx_transfers=%lld tx_bytes=%lld errors=%lld\n",
++		s->tx_dma && s->rx_dma ? 'Y' : 'N', READ_ONCE(dma_enable) ? 'Y' : 'N',
++		atomic64_read(&s->dma_tx_transfers), atomic64_read(&s->dma_tx_bytes),
++		atomic64_read(&s->dma_errors));
++}
++static DEVICE_ATTR_RO(dma_stats);
++
++static struct attribute *esp32s31_spi_attrs[] = {
++	&dev_attr_dma_stats.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(esp32s31_spi);
++
+ static int esp32s31_spi_probe(struct platform_device *pdev)
+ {
+ 	struct spi_controller *ctlr;
+@@ -1025,9 +1150,19 @@ static int esp32s31_spi_probe(struct platform_device *pdev)
+ 	ctlr->max_transfer_size = esp32s31_spi_max_transfer_size;
+ 	ctlr->setup = esp32s31_spi_setup;
+ 	ctlr->transfer_one = esp32s31_spi_transfer_one;
++	ctlr->can_dma = esp32s31_spi_can_dma;
++	ctlr->dma_tx = s->tx_dma;
++	ctlr->dma_rx = s->rx_dma;
++	ctlr->max_dma_len = S31_SPI_DMA_MAX;
+ 	if (target)
+ 		ctlr->target_abort = esp32s31_spi_target_abort;
+ 
++	atomic64_set(&s->dma_tx_transfers, 0);
++	atomic64_set(&s->dma_tx_bytes, 0);
++	atomic64_set(&s->dma_errors, 0);
++	platform_set_drvdata(pdev, s);
++	dev_info(&pdev->dev, "transfer engine: %s; PIO fallback available\n",
++		 s->tx_dma ? "AXI GDMA TX SG, max 32768 bytes" : "PIO");
+ 	return devm_spi_register_controller(&pdev->dev, ctlr);
+ }
+ 
+@@ -1042,6 +1177,7 @@ static struct platform_driver esp32s31_spi_driver = {
+ 	.driver = {
+ 		.name = "esp32s31-gpspi",
+ 		.of_match_table = esp32s31_spi_of_match,
++		.dev_groups = esp32s31_spi_groups,
+ 	},
+ };
+ module_platform_driver(esp32s31_spi_driver);
+diff --git a/linux/include/dt-bindings/clock/esp32s31-clk.h b/linux/include/dt-bindings/clock/esp32s31-clk.h
+index e91ec08..13c64d8 100644
+--- a/linux/include/dt-bindings/clock/esp32s31-clk.h
++++ b/linux/include/dt-bindings/clock/esp32s31-clk.h
+@@ -25,11 +25,13 @@
+ #define ESP32S31_CLK_SDMMC_SYS		10
+ #define ESP32S31_CLK_SDIO_LS		11
+ #define ESP32S31_CLK_GPSPI2		12
++#define ESP32S31_CLK_AXI_GDMA		13
+ 
+ #define ESP32S31_RST_I2C0		0
+ #define ESP32S31_RST_I2C1		1
+ #define ESP32S31_RST_RMT		2
+ #define ESP32S31_RST_GPSPI2		3
++#define ESP32S31_RST_AXI_GDMA		4
+ 
+ /* CNNT_SYS */
+ #define ESP32S31_CNNT_CLK_EMAC_REF	0
+diff --git a/linux/include/dt-bindings/dma/espressif,esp32s31-axi-gdma.h b/linux/include/dt-bindings/dma/espressif,esp32s31-axi-gdma.h
+new file mode 100644
+index 0000000..4b87304
+--- /dev/null
++++ b/linux/include/dt-bindings/dma/espressif,esp32s31-axi-gdma.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++#ifndef _DT_BINDINGS_ESP32S31_AXI_GDMA_H
++#define _DT_BINDINGS_ESP32S31_AXI_GDMA_H
++/* First dma cell: directional channel. Second cell: peripheral selector. */
++#define ESP32S31_GDMA_RX0 0
++#define ESP32S31_GDMA_TX0 1
++#define ESP32S31_GDMA_RX1 2
++#define ESP32S31_GDMA_TX1 3
++#define ESP32S31_GDMA_RX2 4
++#define ESP32S31_GDMA_TX2 5
++#define ESP32S31_GDMA_SPI2 1
++#define ESP32S31_GDMA_SPI3 2
++#endif
+diff --git a/linux/patches/0027-dma-esp32s31-axi-gdma.patch b/linux/patches/0027-dma-esp32s31-axi-gdma.patch
+new file mode 100644
+index 0000000..d033043
+--- /dev/null
++++ b/linux/patches/0027-dma-esp32s31-axi-gdma.patch
+@@ -0,0 +1,33 @@
++Subject: [PATCH] dmaengine: add ESP32-S31 AXI GDMA slave-SG support
++
++--- a/drivers/dma/Kconfig
+++++ b/drivers/dma/Kconfig
++@@ -31,6 +31,18 @@
++ 
++ 
++ if DMADEVICES
+++
+++config ESP32S31_AXI_GDMA
+++	tristate "ESP32-S31 AXI GDMA slave-SG support"
+++	depends on SOC_ESP32S31 || COMPILE_TEST
+++	depends on OF && HAS_IOMEM
+++	select DMA_ENGINE
+++	select DMA_VIRTUAL_CHANNELS
+++	help
+++	  Support the independent TX/RX channels of the ESP32-S31 AXI GDMA
+++	  controller. GPSPI2/GPSPI3 use this engine with peripheral selectors.
+++	  Hardware descriptors use the coherent SRAM pool.
+++
++ 
++ comment "DMA Devices"
++ 
++--- a/drivers/dma/Makefile
+++++ b/drivers/dma/Makefile
++@@ -13,6 +13,7 @@
++ obj-$(CONFIG_DMATEST) += dmatest.o
++ 
++ #devices
+++obj-$(CONFIG_ESP32S31_AXI_GDMA) += esp32s31-axi-gdma.o
++ obj-$(CONFIG_ALTERA_MSGDMA) += altera-msgdma.o
++ obj-$(CONFIG_AMBA_PL08X) += amba-pl08x.o
++ obj-$(CONFIG_AMCC_PPC440SPE_ADMA) += ppc4xx/
+diff --git a/scripts/check-esp32s31-dma.py b/scripts/check-esp32s31-dma.py
+new file mode 100644
+index 0000000..7ff4a47
+--- /dev/null
++++ b/scripts/check-esp32s31-dma.py
+@@ -0,0 +1,442 @@
++#!/usr/bin/env python3
++"""Host regression for actual AXI GDMA descriptor/lifecycle and SPI TX-SG code.
++Fake MMIO validates software contracts, not silicon timing or panel output.
++"""
++import argparse
++import os
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser()
++parser.add_argument("gdma", type=Path)
++parser.add_argument("spi", type=Path)
++args = parser.parse_args()
++
++
++def extract(source, marker):
++    masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
++                    lambda m: " " * len(m.group()), source, flags=re.S)
++    start = source.index(marker)
++    opening = masked.index("{", start)
++    depth = 0
++    for end in range(opening, len(masked)):
++        depth += (masked[end] == "{") - (masked[end] == "}")
++        if not depth:
++            return source[start:end + 1] + (";" if marker.startswith("struct ") else "")
++    raise ValueError(marker)
++
++
++gdma = args.gdma.read_text()
++spi = args.spi.read_text()
++defines = "\n".join(x for x in gdma.splitlines() if x.startswith("#define S31_AXI_"))
++common = r"""
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++typedef uint8_t u8;
++typedef uint32_t u32;
++typedef uint32_t __le32;
++typedef uintptr_t dma_addr_t;
++typedef int64_t atomic64_t;
++typedef int dma_cookie_t;
++typedef int spinlock_t;
++#define __iomem
++#define __aligned(n)
++#define BIT(n) (1U << (n))
++#define GENMASK(h,l) ((~0U >> (31-(h))) & (~0U << (l)))
++#define FIELD_PREP(mask,v) (((v) << __builtin_ctz(mask)) & (mask))
++#define U32_MAX UINT32_MAX
++#define SZ_4K 4096
++#define SZ_32K 32768
++#define SZ_512K 524288
++#define GFP_NOWAIT 0
++#define min_t(type,a,b) ((type)(a)<(type)(b)?(type)(a):(type)(b))
++#define DIV_ROUND_UP(a,b) (((a)+(b)-1)/(b))
++#define upper_32_bits(a) ((uint64_t)(a) >> 32)
++#define lower_32_bits(a) ((uint32_t)(a))
++#define cpu_to_le32(a) (a)
++#define READ_ONCE(x) (x)
++#define IS_ALIGNED(x,n) (!((x)&((n)-1)))
++#define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
++#define struct_size(p,m,n) (sizeof(*(p))+sizeof((p)->m[0])*(n))
++#define kzalloc(size, flags) calloc(1,size)
++#define kfree free
++#define IRQ_NONE 0
++#define IRQ_HANDLED 1
++typedef int irqreturn_t;
++enum dma_transfer_direction { DMA_MEM_TO_DEV=1, DMA_DEV_TO_MEM=2 };
++enum dma_status { DMA_COMPLETE, DMA_IN_PROGRESS, DMA_ERROR };
++enum dmaengine_tx_result { DMA_TRANS_NOERROR, DMA_TRANS_READ_FAILED, DMA_TRANS_WRITE_FAILED };
++enum { DMA_SLAVE_BUSWIDTH_4_BYTES=4, DMA_PREP_INTERRUPT=1, DMA_CTRL_ACK=2 };
++struct device { int unused; };
++struct dma_pool { int unused; };
++struct clk;
++struct completion { bool signalled; };
++struct dma_chan { void *owner; dma_cookie_t completed; };
++struct dma_device { struct device *dev; };
++struct dma_slave_config {
++    enum dma_transfer_direction direction;
++    dma_addr_t src_addr, dst_addr;
++    u32 src_addr_width, dst_addr_width, src_maxburst, dst_maxburst;
++    bool device_fc;
++};
++struct list_head { int unused; };
++struct dma_async_tx_descriptor {
++    struct dma_chan *chan;
++    dma_cookie_t cookie;
++    void (*callback)(void *);
++    void *callback_param;
++};
++struct virt_dma_desc {
++    struct dma_async_tx_descriptor tx;
++    struct list_head node;
++    struct { enum dmaengine_tx_result result; size_t residue; } tx_result;
++};
++struct virt_dma_chan {
++    struct dma_chan chan;
++    spinlock_t lock;
++    struct virt_dma_desc *pending;
++};
++struct scatterlist { dma_addr_t addr; size_t len; };
++struct dma_tx_state { size_t residue; };
++struct of_phandle_args { int args_count; u32 args[2]; };
++struct of_dma { void *of_dma_data; };
++#define for_each_sg(list, sg, count, index) \
++    for(index=0; index<count && ((sg)=&(list)[index],1); index++)
++#define sg_dma_address(sg) ((sg)->addr)
++#define sg_dma_len(sg) ((sg)->len)
++#define list_del(node) ((void)(node))
++static int held, alloc_count, alloc_calls, fail_alloc, callback_count, log_count;
++static bool channel_get_fail;
++static u32 regs[256];
++static bool barrier;
++static void fail(const char *s) { fprintf(stderr,"FAIL: %s\n",s); exit(2); }
++#define dev_err_ratelimited(...) (log_count++)
++#define spin_lock_irqsave(lock, flags) ((void)(lock), (flags)=0, held++)
++#define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags), held--)
++#define spin_lock_irq(lock) ((void)(lock), held++)
++#define spin_unlock_irq(lock) ((void)(lock), held--)
++#define lockdep_assert_held(lock) ((void)(lock))
++static void dma_wmb(void) { barrier=true; }
++static u32 readl(void *p) { return *(u32 *)p; }
++static void writel(u32 v,void *p) { *(u32 *)p=v; }
++#define readl_poll_timeout(addr,val,cond,sleep,timeout) \
++    ({ int ret=-ETIMEDOUT; \
++       if(sleep || !timeout) fail("bounded zero-sleep polling"); \
++       for(unsigned i=0;i<8;i++){val=readl(addr);if(cond){ret=0;break;}} ret; })
++static void *dma_pool_zalloc(struct dma_pool *pool,int flags,dma_addr_t *addr) {
++    (void)pool;(void)flags;
++    static unsigned serial;
++    alloc_calls++;
++    if(fail_alloc && alloc_calls==fail_alloc) return NULL;
++    void *p=calloc(1,16);
++    if(p){*addr=0x2f040000+16*serial++;alloc_count++;}
++    return p;
++}
++static void dma_pool_free(struct dma_pool *pool,void *p,dma_addr_t addr) {
++    (void)pool;(void)addr;free(p);alloc_count--;
++}
++static struct virt_dma_desc *vchan_next_desc(struct virt_dma_chan *vc) {
++    struct virt_dma_desc *vd=vc->pending;vc->pending=NULL;return vd;
++}
++static struct dma_async_tx_descriptor *vchan_tx_prep(struct virt_dma_chan *vc,
++                                                     struct virt_dma_desc *vd,unsigned long flags) {
++    (void)flags;vd->tx.chan=&vc->chan;return &vd->tx;
++}
++static void vchan_cookie_complete(struct virt_dma_desc *vd) {
++    vd->tx.chan->completed=vd->tx.cookie;
++    callback_count++;
++    if(vd->tx.callback) vd->tx.callback(vd->tx.callback_param);
++}
++static enum dma_status dma_cookie_status(struct dma_chan *ch,dma_cookie_t cookie,
++                                         struct dma_tx_state *state) {
++    (void)state;return ch->completed==cookie?DMA_COMPLETE:DMA_IN_PROGRESS;
++}
++static struct virt_dma_desc *vchan_find_desc(struct virt_dma_chan *vc,dma_cookie_t cookie) {
++    (void)vc;(void)cookie;return NULL;
++}
++static void dma_set_residue(struct dma_tx_state *state,size_t n) { state->residue=n; }
++static struct dma_chan *dma_get_slave_channel(struct dma_chan *ch) {
++    if(held) fail("allocator called with peripheral-claim spinlock held");
++    return channel_get_fail?NULL:ch;
++}
++"""
++structs = "\n".join(extract(gdma, m) for m in [
++    "struct s31_axi_hw_desc {", "struct s31_axi_node {", "struct s31_axi_desc {",
++    "struct s31_axi_chan {", "struct s31_axi_dma {",
++])
++functions = "\n".join(extract(gdma, m) for m in [
++    "static struct s31_axi_chan *s31_axi_chan(",
++    "static struct s31_axi_desc *s31_axi_desc(",
++    "static void __iomem *s31_axi_reg(",
++    "static void s31_axi_free_desc(",
++    "static int s31_axi_stop(",
++    "static void s31_axi_start(",
++    "static bool s31_axi_valid_address(",
++    "s31_axi_prep_slave_sg(",
++    "static int s31_axi_config(",
++    "static irqreturn_t s31_axi_irq(",
++    "static enum dma_status s31_axi_tx_status(",
++    "static struct dma_chan *s31_axi_xlate(",
++])
++# prep function's return type is on its preceding line.
++functions = functions.replace("s31_axi_prep_slave_sg(", "static struct dma_async_tx_descriptor *\ns31_axi_prep_slave_sg(", 1)
++setup = r"""
++static struct s31_axi_dma dma;
++static struct device device;
++static void init_dma(void) {
++    memset(&dma,0,sizeof(dma));memset(regs,0,sizeof(regs));
++    dma.base=regs;dma.device.dev=&device;
++    for(unsigned i=0;i<6;i++){
++        struct s31_axi_chan *ch=&dma.channels[i];
++        ch->dma=&dma;ch->id=i/2;ch->tx=i&1;ch->periph=U32_MAX;
++        ch->vc.chan.owner=ch;ch->error_cookie=-EBUSY;
++        regs[(ch->tx?S31_AXI_TX_RESET_AVAIL(ch->id):S31_AXI_RX_RESET_AVAIL(ch->id))/4]=1;
++    }
++}
++static struct s31_axi_desc *desc_from_tx(struct dma_async_tx_descriptor *tx) {
++    return container_of(tx,struct s31_axi_desc,vd.tx);
++}
++static void inspect(struct s31_axi_desc *desc,struct scatterlist *sg,unsigned nents,bool tx) {
++    unsigned index=0;
++    for(unsigned i=0;i<nents;i++){
++        size_t left=sg[i].len;dma_addr_t addr=sg[i].addr;
++        while(left){
++            struct s31_axi_node *node=&desc->nodes[index];
++            u32 ctrl=node->hw->control;
++            unsigned size=ctrl&4095, length=(ctrl>>12)&4095;
++            unsigned want=left>4032?4032:left;
++            if(size!=want || length!=(tx?want:0) || !(ctrl&BIT(31)) ||
++               node->hw->buffer!=addr || node->hw->padding || (node->dma&7))
++                fail("exact LLI size/length/address/owner/alignment/RGB byte order");
++            if(!!(ctrl&BIT(30))!=(tx && index+1==desc->count))
++                fail("only last TX descriptor marks EOF; RX length/EOF start at zero");
++            u32 next=index+1<desc->count?desc->nodes[index+1].dma:0;
++            if(node->hw->next!=next)fail("complete descriptor chain");
++            left-=want;addr+=want;index++;
++        }
++    }
++    if(index!=desc->count)fail("missing/trailing descriptor");
++}
++"""
++provider_main = r"""
++int main(void) {
++    init_dma();
++    _Static_assert(sizeof(struct s31_axi_hw_desc)==16,"padded 8-byte aligned descriptor");
++    const unsigned lengths[]={1,63,64,4031,4032,4095,4096,32768,411640,524288};
++    for(unsigned t=0;t<2;t++){
++        struct s31_axi_chan *ch=&dma.channels[t];ch->periph=1;
++        for(unsigned i=0;i<sizeof(lengths)/sizeof(lengths[0]);i++){
++            struct scatterlist sg={.addr=0x50001003,.len=lengths[i]};
++            struct dma_async_tx_descriptor *tx=s31_axi_prep_slave_sg(&ch->vc.chan,&sg,1,
++                ch->tx?DMA_MEM_TO_DEV:DMA_DEV_TO_MEM,0,NULL);
++            if(!tx)fail("valid unencrypted PSRAM SG rejected");
++            inspect(desc_from_tx(tx),&sg,1,ch->tx);
++            s31_axi_free_desc(&desc_from_tx(tx)->vd);
++            if(alloc_count)fail("descriptor leak");
++        }
++    }
++    struct s31_axi_chan *ch=&dma.channels[1];
++    struct scatterlist pages[9];
++    for(unsigned i=0;i<9;i++)pages[i]=(struct scatterlist){0x50010000+i*8192, i==8?24:4096};
++    for(unsigned nth=1;nth<=18;nth++){
++        alloc_calls=0;fail_alloc=nth;
++        struct dma_async_tx_descriptor *tx=s31_axi_prep_slave_sg(&ch->vc.chan,pages,9,DMA_MEM_TO_DEV,0,NULL);
++        if(tx)s31_axi_free_desc(&desc_from_tx(tx)->vd);
++        if(alloc_count)fail("partial allocation failure leak");
++    }
++    fail_alloc=0;
++    struct scatterlist bads[]={{0x53ffffff,2},{0x100000000ULL,64},{0x50000000,524289},{0x50000000,0}};
++    for(unsigned i=0;i<4;i++)
++        if(s31_axi_prep_slave_sg(&ch->vc.chan,&bads[i],1,DMA_MEM_TO_DEV,0,NULL))
++            fail("invalid/wrapped/oversized memory range");
++    struct scatterlist good={0x50001000,64};
++    if(s31_axi_prep_slave_sg(&ch->vc.chan,&good,1,DMA_DEV_TO_MEM,0,NULL))
++        fail("TX channel accepted RX direction");
++    for(unsigned error=0;error<2;error++){
++        struct dma_async_tx_descriptor *tx=s31_axi_prep_slave_sg(&ch->vc.chan,&good,1,DMA_MEM_TO_DEV,0,NULL);
++        tx->cookie=error+1;ch->vc.pending=&desc_from_tx(tx)->vd;
++        barrier=false;s31_axi_start(ch);
++        if(!barrier || readl(s31_axi_reg(ch,S31_AXI_LINK2))!=ch->active->nodes[0].dma ||
++           readl(s31_axi_reg(ch,S31_AXI_INT_ENA))!=(BIT(3)|BIT(2)|BIT(4)|BIT(5)) ||
++           readl(s31_axi_reg(ch,S31_AXI_PERI_SEL))!=1)
++            fail("TX arm order / final EOF mask / peripheral selector");
++        /* Stopping TX0 must leave RX0 untouched. */
++        regs[S31_AXI_RX_BASE(0)/4+S31_AXI_CONF0/4]=0x12345670;
++        writel(error?BIT(2):BIT(3),s31_axi_reg(ch,S31_AXI_INT_ST));
++        if(s31_axi_irq(1,ch)!=IRQ_HANDLED || ch->active ||
++           regs[S31_AXI_RX_BASE(0)/4+S31_AXI_CONF0/4]!=0x12345670)
++            fail("independent TX/RX lifecycle");
++        if(s31_axi_tx_status(&ch->vc.chan,tx->cookie,NULL)!=(error?DMA_ERROR:DMA_COMPLETE))
++            fail("DMA error reported as success");
++        s31_axi_free_desc(&desc_from_tx(tx)->vd);
++    }
++    regs[S31_AXI_TX_RESET_AVAIL(0)/4]=0;
++    int before=callback_count;
++    if(s31_axi_stop(ch)!=-ETIMEDOUT || before!=callback_count ||
++       !(readl(s31_axi_reg(ch,S31_AXI_CONF0))&S31_AXI_TX_ABORT))
++        fail("abort deadline must retain DMA-owned descriptors");
++    init_dma();
++    struct of_dma of={.of_dma_data=&dma};
++    struct of_phandle_args a={.args_count=2,.args={1,1}};
++    if(!s31_axi_xlate(&a,&of))fail("TX0 SPI2 claim");
++    a.args[0]=3;if(s31_axi_xlate(&a,&of))fail("duplicate SPI2 TX connection");
++    a.args[0]=0;if(!s31_axi_xlate(&a,&of))fail("SPI2 RX connection");
++    a.args[0]=4;a.args[1]=2;channel_get_fail=true;
++    if(s31_axi_xlate(&a,&of)||dma.channels[4].periph!=U32_MAX)fail("failed claim retained");
++    channel_get_fail=false;if(!s31_axi_xlate(&a,&of))fail("released claim cannot be reused");
++    a.args[0]=6;if(s31_axi_xlate(&a,&of))fail("invalid channel");
++    if(alloc_count||held)fail("resource/lock leak");
++    puts("PASS: actual GDMA SG LLIs; 512K/unaligned/tails/allocation failures;"
++         " IRQ/error/abort lifecycle; independent channels; exclusive peripheral claims");
++    return 0;
++}
++"""
++spi_defines = "\n".join(x for x in spi.splitlines() if x.startswith("#define S31_SPI_"))
++spi_header = r"""
++struct sg_table {struct scatterlist *sgl;unsigned nents;};
++struct spi_controller {void *data;};
++struct spi_device {struct spi_controller *controller;};
++struct spi_transfer {
++    const void *tx_buf;void *rx_buf;unsigned len;
++    struct sg_table tx_sg;
++};
++static bool dma_enable=true;
++static void *spi_controller_get_devdata(struct spi_controller *c){return c->data;}
++static unsigned spi_controller_xfer_timeout(struct spi_controller *c,struct spi_transfer *t){
++    (void)c;(void)t;return 200;
++}
++static u32 spi_regs[64];
++static int injection, submitted, terminated, fifo_writes;
++static struct s31_axi_desc *submitted_desc;
++static void atomic64_inc(atomic64_t *v){(*v)++;}
++static void atomic64_add(unsigned n,atomic64_t *v){*v+=n;}
++static void reinit_completion(struct completion *c){c->signalled=false;}
++static void complete(struct completion *c){c->signalled=true;}
++static unsigned long msecs_to_jiffies(unsigned ms){return ms;}
++static unsigned wait_for_completion_timeout(struct completion *c,unsigned long ms){
++    (void)ms;return c->signalled;
++}
++static void synchronize_irq(int irq){(void)irq;}
++static int dmaengine_slave_config(struct dma_chan *ch,struct dma_slave_config *c){
++    return injection==1?-EINVAL:s31_axi_config(ch,c);
++}
++static struct dma_async_tx_descriptor *dmaengine_prep_slave_sg(struct dma_chan *ch,
++    struct scatterlist *sg,unsigned n,enum dma_transfer_direction dir,unsigned flags){
++    if(injection==2)return NULL;
++    struct dma_async_tx_descriptor *tx=s31_axi_prep_slave_sg(ch,sg,n,dir,flags,NULL);
++    if(tx)submitted_desc=desc_from_tx(tx);
++    return tx;
++}
++static dma_cookie_t dmaengine_submit(struct dma_async_tx_descriptor *tx){
++    static unsigned cookie;submitted++;tx->cookie=++cookie;
++    return injection==3?-EINVAL:tx->cookie;
++}
++static int dma_submit_error(dma_cookie_t cookie){return cookie<0?cookie:0;}
++static void dma_async_issue_pending(struct dma_chan *chan){
++    struct s31_axi_chan *ch=s31_axi_chan(chan);
++    if(!(spi_regs[S31_SPI_DMA_CONF/4]&S31_SPI_DMA_TX_EN))fail("SPI AFIFO not enabled before GDMA start");
++    ch->vc.pending=&submitted_desc->vd;s31_axi_start(ch);
++}
++static int dmaengine_terminate_sync(struct dma_chan *chan){
++    struct s31_axi_chan *ch=s31_axi_chan(chan);terminated++;
++    if(s31_axi_stop(ch))fail("DMA abort recovery");
++    ch->active=NULL;
++    if(submitted_desc){s31_axi_free_desc(&submitted_desc->vd);submitted_desc=NULL;}
++    return 0;
++}
++static enum dma_status dma_async_is_tx_complete(struct dma_chan *ch,dma_cookie_t cookie,void *a,void *b){
++    (void)a;(void)b;return s31_axi_tx_status(ch,cookie,NULL);
++}
++"""
++spi_helpers = r"""
++static void esp32s31_spi_dma_complete(void *p){complete(p);}
++static void esp32s31_spi_target_reset(struct esp32s31_spi *s){
++    writel(0,s->base+S31_SPI_CMD);
++}
++static int esp32s31_spi_wait_transaction(struct esp32s31_spi *s,unsigned timeout){
++    (void)timeout;
++    if(injection==4)return -ETIMEDOUT;
++    struct s31_axi_chan *ch=s31_axi_chan(s->tx_dma);
++    if(spi_regs[S31_SPI_MS_DLEN/4]!=submitted_desc->len*8-1 ||
++       submitted_desc->len>32768 || !(spi_regs[S31_SPI_USER/4]&S31_SPI_FWRITE_QUAD))
++        fail("SPI data bit length / quad width");
++    if(injection!=5){
++        writel(injection==6?BIT(2):BIT(3),s31_axi_reg(ch,S31_AXI_INT_ST));
++        s31_axi_irq(1,ch);
++    }
++    if(injection==7)spi_regs[S31_SPI_INT_RAW/4]=S31_SPI_MST_TX_AFIFO_REMPTY_ERR;
++    return 0;
++}
++"""
++spi_main = r"""
++int main(void){
++    init_dma();struct s31_axi_chan *ch=&dma.channels[1];ch->periph=1;
++    struct esp32s31_spi s={.base=spi_regs,.tx_dma=&ch->vc.chan,
++                          .rx_dma=&dma.channels[0].vc.chan,.dev=&device};
++    struct spi_controller ctlr={.data=&s};struct spi_device dev={.controller=&ctlr};
++    struct scatterlist pages[8];struct spi_transfer t={.tx_buf=(void *)0x1000};
++    unsigned left=411640,total=0,transfers=0;
++    while(left){
++        unsigned len=left>32768?32768:left,nents=(len+4095)/4096;
++        for(unsigned i=0;i<nents;i++)
++            pages[i]=(struct scatterlist){0x50001000+i*8192,i+1<nents?4096:len-i*4096};
++        t.len=len;t.tx_sg=(struct sg_table){pages,nents};
++        memset(spi_regs,0,sizeof(spi_regs));spi_regs[S31_SPI_USER/4]=S31_SPI_FWRITE_QUAD;
++        if(!esp32s31_spi_can_dma(&ctlr,&dev,&t))fail("aligned TX-SG was rejected");
++        if(esp32s31_spi_dma_tx_sg(&s,&ctlr,&t,0))fail("TX-SG returned error");
++        inspect(submitted_desc,pages,nents,true);
++        s31_axi_free_desc(&submitted_desc->vd);submitted_desc=NULL;
++        total+=len;left-=len;transfers++;
++        if(alloc_count || spi_regs[S31_SPI_DMA_CONF/4]&S31_SPI_DMA_TX_EN)
++            fail("DMA resource or AFIFO enable leaked after success");
++    }
++    if(total!=411640 || transfers!=13 || s.dma_tx_transfers!=13 ||
++       s.dma_tx_bytes!=411640 || s.dma_errors)
++        fail("full-frame segmentation/counters");
++    for(injection=1;injection<=7;injection++){
++        t.len=256;pages[0]=(struct scatterlist){0x50001000,256};
++        t.tx_sg=(struct sg_table){pages,1};memset(spi_regs,0,sizeof(spi_regs));
++        spi_regs[S31_SPI_USER/4]=S31_SPI_FWRITE_QUAD;
++        int ret=esp32s31_spi_dma_tx_sg(&s,&ctlr,&t,0);
++        if(ret>=0 || alloc_count || submitted_desc || s.dma_errors!=injection)
++            fail("DMA failures must propagate and release descriptors");
++    }
++    injection=0;dma_enable=false;
++    if(esp32s31_spi_can_dma(&ctlr,&dev,&t))fail("PIO fallback parameter ignored");
++    dma_enable=true;t.rx_buf=(void *)1;
++    if(esp32s31_spi_can_dma(&ctlr,&dev,&t))fail("RX incorrectly mapped as TX-SG");
++    t.rx_buf=NULL;t.tx_buf=(void *)0x1001;
++    if(esp32s31_spi_can_dma(&ctlr,&dev,&t))fail("unaligned TX fallback");
++    if(esp32s31_spi_max_transfer_size(&dev)!=32768)fail("MS_DLEN cap");
++    s.target=true;
++    if(esp32s31_spi_max_transfer_size(&dev)!=4096)fail("target bounce buffer cap");
++    puts("PASS: actual SPI TX-SG + GDMA chain; 13 transfers/411640 bytes;"
++         " quad/MS_DLEN; DMA error propagation/cleanup; counters; PIO fallback");
++    return 0;
++}
++"""
++programs = [
++    "\n".join([common, defines, structs, functions, setup, provider_main]),
++    common + "\n" + defines + "\n" + structs + "\n" + functions + "\n" + setup + "\n" + spi_defines + "\n" + spi_header + "\n" +
++    extract(spi, "struct esp32s31_spi {") + spi_helpers +
++    extract(spi, "static size_t esp32s31_spi_max_transfer_size(") +
++    extract(spi, "static bool esp32s31_spi_can_dma(") +
++    extract(spi, "static int esp32s31_spi_dma_tx_sg(") + spi_main,
++]
++with tempfile.TemporaryDirectory(prefix="s31-dma-test-") as temp:
++    for i, program in enumerate(programs):
++        path = Path(temp) / f"test{i}.c"
++        exe = Path(temp) / f"test{i}"
++        path.write_text(program)
++        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
++                        "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
++                        str(path), "-o", str(exe)], check=True)
++        subprocess.run([str(exe)], check=True,
++                       env=dict(os.environ, ASAN_OPTIONS="detect_leaks=0"))
+diff --git a/scripts/check-esp32s31-pio.py b/scripts/check-esp32s31-pio.py
+index a45624a..fddb12e 100644
+--- a/scripts/check-esp32s31-pio.py
++++ b/scripts/check-esp32s31-pio.py
+@@ -41,6 +41,7 @@ header = r"""
+ typedef uint8_t u8;
+ typedef uint32_t u32;
+ typedef uintptr_t dma_addr_t;
++typedef int64_t atomic64_t;
+ #define __iomem
+ #define BIT(n) (1U << (n))
+ #define GENMASK(h, l) ((~0U >> (31-(h))) & (~0U << (l)))
+@@ -50,6 +51,7 @@ typedef uintptr_t dma_addr_t;
+ #define min_t(type,a,b) ((type)(a)<(type)(b)?(type)(a):(type)(b))
+ #define max_t(type,a,b) ((type)(a)>(type)(b)?(type)(a):(type)(b))
+ #define SZ_4K 4096
++#define SZ_32K 32768
+ #define SZ_512K 524288
+ #define READ_ONCE(x) (x)
+ #define SPI_CPOL BIT(0)
+@@ -74,7 +76,7 @@ struct spi_transfer {
+     void *rx_buf;
+     unsigned int len, speed_hz, effective_speed_hz;
+     unsigned int tx_nbits, rx_nbits;
+-    bool cs_change, last;
++    bool cs_change, last, tx_sg_mapped;
+ };
+ static void *spi_controller_get_devdata(struct spi_controller *c) { return c->data; }
+ static u32 spi_get_chipselect(struct spi_device *spi, unsigned int n) {
+@@ -92,6 +94,7 @@ static unsigned int spi_controller_xfer_timeout(struct spi_controller *c,
+     (void)c; (void)t; return 200;
+ }
+ static bool pio_poll = true;
++static bool dma_enable = true;
+ static unsigned int syncs, chunks, legacy, rescheds, target_calls, dma_calls;
+ static unsigned int fail_stage, error_calls, stage, ticks, wanted_lanes;
+ static unsigned int soft_resets;
+@@ -190,6 +193,10 @@ static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s, struct spi_controll
+                                     struct spi_transfer *t, u32 misc) {
+     (void)s; (void)c; (void)t; (void)misc; dma_calls++; return 0;
+ }
++static int esp32s31_spi_dma_tx_sg(struct esp32s31_spi *s, struct spi_controller *c,
++                                  struct spi_transfer *t, u32 misc) {
++    return esp32s31_spi_dma_transfer(s, c, t, misc);
++}
+ static int esp32s31_spi_dma_duplex_transfer(struct esp32s31_spi *s, struct spi_controller *c,
+                                           struct spi_transfer *t, u32 misc) {
+     return esp32s31_spi_dma_transfer(s, c, t, misc);
+@@ -261,7 +268,7 @@ int main(void) {
+     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || target_calls!=1)
+         fail("target path");
+     state.target=false; state.tx_dma=state.rx_dma=(struct dma_chan *)1;
+-    if (esp32s31_spi_max_transfer_size(&spi)!=SZ_4K) fail("DMA bounce buffer limit");
++    if (esp32s31_spi_max_transfer_size(&spi)!=S31_SPI_DMA_MAX) fail("host DMA MS_DLEN limit");
+     t.tx_buf=storage; t.rx_buf=NULL; t.len=128; reset_capture(storage,t.len);
+     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || dma_calls!=1 || syncs)
+         fail("DMA path preserved");
+diff --git a/scripts/prepare-amoled-share.py b/scripts/prepare-amoled-share.py
+new file mode 100755
+index 0000000..744eae7
+--- /dev/null
++++ b/scripts/prepare-amoled-share.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++"""Validate and prepare the user-tested PIO pair for ESP Forge + separate USB download.
++Run on WSL/build host. Does not build, flash, upload, or modify an input image.
++"""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import tempfile
++
++PIO_COMMIT = "ab6cd0be1ff52c1baac86ac93629af7b88e7a33b"
++REPO = Path(__file__).resolve().parent.parent
++
++
++def git_blob(path):
++    return subprocess.check_output(["git", "show", f"{PIO_COMMIT}:{path}"], cwd=REPO)
++
++
++def sha256(path):
++    h = hashlib.sha256()
++    with path.open("rb") as stream:
++        for data in iter(lambda: stream.read(4 * 1024 * 1024), b""):
++            h.update(data)
++    return h.hexdigest()
++
++
++def executable_lines(data):
++    return [line.strip() for line in data.decode().splitlines()
++            if line.strip() and not line.lstrip().startswith("#")]
++
++
++def debugfs(image, path):
++    result = subprocess.run(["debugfs", "-R", f"cat {path}", str(image)],
++                            capture_output=True, check=True)
++    if not result.stdout:
++        raise ValueError(f"rootfs is missing {path}")
++    return result.stdout
++
++
++def check_rootfs(sdcard):
++    with sdcard.open("rb") as stream:
++        mbr = stream.read(512)
++        if len(mbr) != 512 or mbr[510:] != b"\x55\xaa":
++            raise ValueError("sdcard.img has no valid MBR")
++        if struct.unpack_from("<I", mbr, 440)[0] != 0x45533331:
++            raise ValueError("USB PARTUUID does not match the kernel")
++        entry = mbr[462:478]  # Second partition entry: Linux rootfs.
++        start, sectors = struct.unpack_from("<II", entry, 8)
++        if entry[4] != 0x83 or not sectors or (start + sectors) * 512 > sdcard.stat().st_size:
++            raise ValueError("sdcard.img has no complete Linux root partition")
++        stream.seek(start * 512)
++        with tempfile.NamedTemporaryFile(prefix="co5300-share-root-", suffix=".img") as root:
++            left = sectors * 512
++            while left:
++                data = stream.read(min(left, 4 * 1024 * 1024))
++                if not data:
++                    raise ValueError("truncated root partition")
++                # Preserve zero ranges as holes; no mount/root privileges needed.
++                if data.count(0) == len(data):
++                    root.seek(len(data), 1)
++                else:
++                    root.write(data)
++                left -= len(data)
++            root.truncate(sectors * 512)
++            root.flush()
++            wrapper = debugfs(Path(root.name), "/sbin/amoled-getty")
++            if executable_lines(wrapper) != executable_lines(
++                    git_blob("br2-external/board/esp32s31/amoled-getty")):
++                raise ValueError("USB getty wrapper differs from the tested PIO wrapper")
++            inittab = debugfs(Path(root.name), "/etc/inittab").decode()
++            if [x for x in inittab.splitlines() if x.startswith("tty0::respawn:")] != [
++                    "tty0::respawn:/sbin/amoled-getty"]:
++                raise ValueError("USB rootfs must have exactly one AMOLED wrapper getty")
++            mode = subprocess.check_output(
++                ["debugfs", "-R", "stat /sbin/amoled-getty", root.name],
++                stderr=subprocess.DEVNULL).decode()
++            if "Mode:  0755" not in mode and "Mode: 0755" not in mode:
++                raise ValueError("USB getty wrapper must be executable (0755)")
++            return debugfs(Path(root.name), "/usr/lib/os-release").decode()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--flash", type=Path, default=REPO / "build/coreboard1/flash.bin")
++    parser.add_argument("--sdcard", type=Path, default=REPO / "build/coreboard1/buildroot/sdcard.img")
++    parser.add_argument("--kernel-build", type=Path,
++                        default=REPO / "build/br-output-coreboard1-amoled/build/linux-7.3.4")
++    parser.add_argument("--output", type=Path, default=REPO / "build/share-co5300-pio")
++    parser.add_argument("--usb-url", default="", help="Public URL of this exact sdcard.img")
++    args = parser.parse_args()
++    for path in [args.flash, args.sdcard]:
++        if not path.is_file() or not path.stat().st_size:
++            raise ValueError(f"missing artifact: {path}")
++    for path in ["drivers/spi/spi-esp32s31.c", "drivers/video/fbdev/co5300fb.c",
++                 "drivers/clk/clk-esp32s31.c",
++                 "arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts",
++                 "arch/riscv/boot/dts/espressif/esp32s31.dtsi"]:
++        if (args.kernel_build / path).read_bytes() != git_blob("linux/" + path):
++            raise ValueError(f"kernel source differs from the tested PIO revision: {path}")
++    config = (args.kernel_build / ".config").read_text()
++    for setting in ['CONFIG_FB_CO5300=y', 'CONFIG_FRAMEBUFFER_CONSOLE=y',
++                    'CONFIG_BUILTIN_DTB_NAME="espressif/esp32s31_coreboard1_amoled"']:
++        if setting not in config.splitlines():
++            raise ValueError(f"wrong kernel configuration: {setting}")
++    if "CONFIG_ESP32S31_AXI_GDMA=y" in config.splitlines():
++        raise ValueError("DMA image cannot be labelled as the user-tested PIO release")
++    image = (args.kernel_build / "arch/riscv/boot/Image").read_bytes()
++    flash = args.flash.read_bytes()
++    # Linux 7.3.4 arch/riscv/include/asm/image.h: 64-byte boot header.
++    if len(image) < 64 or image[48:56] != b"RISCV\x00\x00\x00" or image[56:60] != b"RSC\x05":
++        raise ValueError("kernel Image has no valid RISC-V boot header")
++    if not image or image not in flash or b"tiled single-window" not in image:
++        raise ValueError("flash.bin does not contain this PIO kernel Image")
++    if b"AXI GDMA TX SG" in image:
++        raise ValueError("DMA kernel cannot be labelled as PIO")
++    os_release = check_rootfs(args.sdcard)
++    main_head = subprocess.check_output(["git", "ls-remote", "origin", "refs/heads/main"],
++                                        cwd=REPO, text=True).split()[0]
++    subprocess.run(["git", "merge-base", "--is-ancestor", PIO_COMMIT, main_head],
++                   cwd=REPO, check=True)
++    hashes = {p.name: sha256(p) for p in [args.flash, args.sdcard]}
++    args.output.mkdir(parents=True, exist_ok=True)
++    for src, name in [(args.flash, "flash.bin"), (args.sdcard, "sdcard.img")]:
++        dst = args.output / name
++        if dst.exists() and sha256(dst) != hashes[src.name]:
++            raise ValueError(f"refusing to overwrite a different release artifact: {dst}")
++        if not dst.exists():
++            shutil.copyfile(src, dst)
++        if sha256(dst) != hashes[src.name]:
++            raise ValueError(f"copy checksum failed: {dst}")
++    manifest = {
++        "kind": "user-tested PIO, not DMA",
++        "source_commit": PIO_COMMIT, "main_contains_source": True,
++        "kernel_build": str(args.kernel_build.resolve()),
++        "rootfs_os_release": os_release,
++        "hardware_test": "User 2026-11-19: median 87667 us, 3/5 samples below 100 ms, errors=0",
++        "checks": ["kernel source matches PIO revision", "Image present in flash.bin",
++                   "USB MBR/PARTUUID", "wrapper content/executable mode", "single tty0 getty",
++                   "copied artifact SHA256"],
++        "files": {name: {"sha256": hashes[src.name], "bytes": src.stat().st_size}
++                  for src, name in [(args.flash, "flash.bin"), (args.sdcard, "sdcard.img")]},
++        "usb_url": args.usb_url or None,
++        "upload_status": "prepared locally; no upload performed",
++    }
++    (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
++    (args.output / "SHA256SUMS").write_text(
++        "".join(f"{manifest['files'][name]['sha256']}  {name}\n" for name in ["flash.bin", "sdcard.img"]))
++    description = (
++        "ESP32-S31 Linux on CO5300 AMOLED (410x502 native, 502x410 landscape, 40 MHz QSPI).\n"
++        "1. Flash flash.bin at offset 0x0 using the ESP Forge Web Flasher.\n"
++        f"2. Download sdcard.img: {args.usb_url or '[LINK_SDCARD_IMG]'}\n"
++        "Write sdcard.img to a USB stick using balenaEtcher; plug it into USB-A and power on.\n"
++        "Linux kernel boot log and a clean login prompt appear on the panel.\n"
++        "User-tested PIO polling: median ~87 ms/frame; a light scan line remains. DMA is in development.\n"
++        f"Source: https://github.com/pangcrd/esp32-s31-linux-amoled/tree/{PIO_COMMIT}\n"
++        "SSH uses keys. Add your own public key via the serial console before using SSH.\n"
++    )
++    (args.output / "forge-description.txt").write_text(description)
++    print(f"Prepared {args.output}: flash.bin, sdcard.img, SHA256SUMS, manifest.json, forge-description.txt")
++    if not args.usb_url:
++        print("Add the sdcard.img download URL before posting on ESP Forge.")
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except (ValueError, FileNotFoundError, subprocess.CalledProcessError) as error:
++        raise SystemExit(f"Share pack not ready: {error}")
+diff --git a/scripts/test-amoled-speed.sh b/scripts/test-amoled-speed.sh
+index 926cdc1..46abffe 100755
+--- a/scripts/test-amoled-speed.sh
++++ b/scripts/test-amoled-speed.sh
+@@ -23,4 +23,9 @@ for sample in 1 2 3 4 5; do
+ 	dd if="$frame" of=/dev/fb0 bs=411640 count=1
+ 	sleep 1
+ 	cat "$stats"
++	for dma_stats in /sys/class/spi_master/spi*/device/dma_stats; do
++		if [ -r "$dma_stats" ]; then
++			cat "$dma_stats"
++		fi
++	done
+ done

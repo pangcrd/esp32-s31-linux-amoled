@@ -1,0 +1,15 @@
+What:		/sys/class/spi_master/spiN/device/dma_stats
+Date:		November 2026
+Description:
+		Read-only ESP32-S31 GPSPI DMA statistics. dma_available indicates
+		whether both DMA channels were obtained. dma_enabled reports the
+		current dma_enable parameter; mapped transfers already queued may
+		still finish with DMA after the parameter is disabled.
+
+		tx_transfers and tx_bytes count successful host TX scatter-gather
+		DMA transactions and pixel/data bytes. A 411640-byte frame uses
+		13 transactions because MS_DLEN is limited to 32768 bytes.
+		errors counts failures in that TX scatter-gather path. Legacy
+		target/RX/duplex bounce transfers are outside these counters.
+		The counters reset at probe; reading this file neither transfers
+		data nor writes to the framebuffer console.

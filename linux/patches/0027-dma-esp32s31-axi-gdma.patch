@@ -1,0 +1,33 @@
+Subject: [PATCH] dmaengine: add ESP32-S31 AXI GDMA slave-SG support
+
+--- a/drivers/dma/Kconfig
++++ b/drivers/dma/Kconfig
+@@ -31,6 +31,18 @@
+ 
+ 
+ if DMADEVICES
++
++config ESP32S31_AXI_GDMA
++	tristate "ESP32-S31 AXI GDMA slave-SG support"
++	depends on SOC_ESP32S31 || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	select DMA_ENGINE
++	select DMA_VIRTUAL_CHANNELS
++	help
++	  Support the independent TX/RX channels of the ESP32-S31 AXI GDMA
++	  controller. GPSPI2/GPSPI3 use this engine with peripheral selectors.
++	  Hardware descriptors use the coherent SRAM pool.
++
+ 
+ comment "DMA Devices"
+ 
+--- a/drivers/dma/Makefile
++++ b/drivers/dma/Makefile
+@@ -13,6 +13,7 @@
+ obj-$(CONFIG_DMATEST) += dmatest.o
+ 
+ #devices
++obj-$(CONFIG_ESP32S31_AXI_GDMA) += esp32s31-axi-gdma.o
+ obj-$(CONFIG_ALTERA_MSGDMA) += altera-msgdma.o
+ obj-$(CONFIG_AMBA_PL08X) += amba-pl08x.o
+ obj-$(CONFIG_AMCC_PPC440SPE_ADMA) += ppc4xx/

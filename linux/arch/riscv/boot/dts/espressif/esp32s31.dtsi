@@ -323,6 +323,21 @@
 			status = "disabled";
 		};
 
+		axi_gdma: dma-controller@20348000 {
+			compatible = "espressif,esp32s31-axi-gdma";
+			reg = <0x20348000 0x2000>;
+			clocks = <&hp_clkrst ESP32S31_CLK_AXI_GDMA>;
+			resets = <&hp_clkrst ESP32S31_RST_AXI_GDMA>;
+			#dma-cells = <2>;
+			interrupt-parent = <&clic>;
+			/* CPU input, SoC source, type; IDF interrupt table 48..53. */
+			interrupts = <42 48 IRQ_TYPE_LEVEL_HIGH>, <43 51 IRQ_TYPE_LEVEL_HIGH>,
+				     <44 49 IRQ_TYPE_LEVEL_HIGH>, <45 52 IRQ_TYPE_LEVEL_HIGH>,
+				     <46 50 IRQ_TYPE_LEVEL_HIGH>, <47 53 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "rx0", "tx0", "rx1", "tx1", "rx2", "tx2";
+			status = "disabled";
+		};
+
 		gpspi2: spi@2038f000 {
 			compatible = "espressif,esp32s31-gpspi";
 			reg = <0x2038f000 0x1000>;
