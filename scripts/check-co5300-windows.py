@@ -21,6 +21,9 @@ masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
 def block(marker):
     start = source.index(marker)
     opening = masked.index("{", start)
+    while not marker.startswith("struct ") and masked.find(";", start, opening) >= 0:
+        start = source.index(marker, start + len(marker))
+        opening = masked.index("{", start)
     depth = 0
     for end in range(opening, len(masked)):
         depth += (masked[end] == "{") - (masked[end] == "}")
@@ -105,6 +108,7 @@ struct spi_transfer {
 #define cond_resched() ((void)0)
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
+#define max_t(type, a, b) max((type)(a), (type)(b))
 #define min_t(type, a, b) min((type)(a), (type)(b))
 #define HZ 100
 #define PAGE_SIZE 4096
@@ -122,6 +126,41 @@ static bool render_diagnostics = true;
 static bool resuming;
 static int reset_raw = 1, resume_fail;
 static unsigned resume_calls, sleep_ms;
+static unsigned reset_calls, reset_us;
+static int reset_fail;
+static bool reinitializing, te_off, testing_panel;
+static unsigned init_calls, init_fail, test_calls, test_phase, test_windows, test_fail;
+static u32 test_mode;
+static bool custom_init;
+static int gpiod_direction_output_raw(struct gpio_desc *reset, int value) {
+    (void)reset;
+    reset_calls++;
+    if (reset_fail) return reset_fail;
+    reset_raw = value;
+    return 0;
+}
+static void gpiod_set_raw_value_cansleep(struct gpio_desc *reset, int value) {
+    (void)reset; reset_raw = value;
+}
+static void usleep_range(unsigned low, unsigned high) {
+    (void)high; reset_us += low;
+}
+#define GFP_KERNEL 0
+static bool device_property_present(struct device *dev, const char *name) {
+    (void)dev; (void)name; return custom_init;
+}
+static int device_property_count_u8(struct device *dev, const char *name) {
+    (void)dev; (void)name; return 5;
+}
+static void *devm_kmalloc(struct device *dev, size_t size, int flags) {
+    static u8 memory[4096]; (void)dev; (void)flags;
+    return size <= sizeof(memory) ? memory : NULL;
+}
+static int device_property_read_u8_array(struct device *dev, const char *name, u8 *out, size_t size) {
+    const u8 invalid[] = { 0xfe, 2, 0, 0, 0 }; /* Record is truncated. */
+    (void)dev; (void)name;
+    memcpy(out, invalid, size); return 0;
+}
 static int gpiod_get_raw_value_cansleep(struct gpio_desc *reset) {
     (void)reset; return reset_raw;
 }
@@ -137,6 +176,52 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
                              unsigned int n) {
     (void)dev;
     const u8 *b = t[0].tx_buf;
+    if (reinitializing) {
+        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x35, 0x53, 0x51, 0x63, 0x11, 0x29 };
+        static const u8 values[] = { 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
+        unsigned i = init_calls++;
+        if (n != 1 || i >= ARRAY_SIZE(commands) || t[0].len != (i < 7 ? 5 : 4) ||
+            b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
+            (i < 7 && b[4] != values[i]))
+            fail("full supplier reinit sequence and RGB565/TE parameters");
+        if (i == 8) reinitializing = false;
+        return init_fail == i + 1 ? -EIO : 0;
+    }
+    if (te_off) {
+        if (n != 1 || t[0].len != 4 || b[0] != 2 || b[1] || b[2] != 0x34 || b[3])
+            fail("TE-off must be DCS 34h with no parameter");
+        test_calls++;
+        return test_fail ? -EIO : 0;
+    }
+    if (testing_panel) {
+        test_calls++;
+        if (test_fail == test_calls) return -EIO;
+        u32 cfirst = test_mode == 2 && test_windows == 1 ? 124 : 22;
+        u32 clast = test_mode == 2 && test_windows == 1 ? 327 : 431;
+        u32 rfirst = test_mode == 2 && test_windows == 1 ? 126 : 0;
+        u32 rlast = test_mode == 2 && test_windows == 1 ? 375 : 501;
+        if (test_phase < 2) {
+            if (n != 1 || t[0].len != 8 || b[0] != 2 || b[1] || b[3] ||
+                b[2] != (test_phase ? 0x2b : 0x2a)) fail("direct test address command");
+            u32 first = ((u32)b[4] << 8) | b[5], last = ((u32)b[6] << 8) | b[7];
+            if (first != (test_phase ? rfirst : cfirst) || last != (test_phase ? rlast : clast) ||
+                (first & 1) || ((last - first + 1) & 1)) fail("direct test even full/center window");
+            test_phase++;
+        } else {
+            static const u8 ramwr[] = { 0x32, 0, 0x2c, 0 };
+            u32 bytes = (clast - cfirst + 1) * (rlast - rfirst + 1) * 2;
+            if (n != 2 || t[0].len != 4 || memcmp(b, ramwr, 4) || t[0].cs_change ||
+                t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != bytes)
+                fail("direct test mixed-lane payload and one CS assertion");
+            u16 color = test_mode == 1 ? 0xf800 : test_windows ? 0x07e0 : 0;
+            const u8 *pixels = t[1].tx_buf;
+            for (u32 i = 0; i < bytes; i += 2)
+                if (pixels[i] != color >> 8 || pixels[i + 1] != (color & 255))
+                    fail("direct test must bypass render and send exact solid-color bytes");
+            test_phase = 0; test_windows++;
+        }
+        return 0;
+    }
     if (resuming) {
         static const u8 commands[] = { 0x11, 0x53, 0x51, 0x63, 0x29 };
         unsigned i = resume_calls++;
@@ -291,6 +376,99 @@ static void settings(void) {
         fail("invalid resume request must not send commands");
     resuming = false; free(p.command);
 }
+static void direct_panel(u32 rot) {
+    struct spi_device spi = {0};
+    struct co5300fb p = { .spi = &spi, .width = rot % 180 ? 410 : 502,
+                         .height = rot % 180 ? 502 : 410, .rotation = rot, .yoff = 22,
+                         .defio = { .delay = 4 } };
+    /* A NULL screen_buffer proves these commands cannot depend on fbdev/render. */
+    struct fb_info info = { .par = &p };
+    spi.data = &info;
+    struct device *dev = &spi.dev;
+    p.command = calloc(259, 1); p.pixels = malloc(411640);
+    if (!p.command || !p.pixels) fail("test allocation");
+    for (test_mode = 1; test_mode <= 2; test_mode++) {
+        testing_panel = true; test_calls = test_phase = test_windows = test_fail = 0;
+        const char *request = test_mode == 1 ? "1" : "2";
+        if (panel_test_store(dev, NULL, request, 1) != 1 || !p.panel_test_active ||
+            p.panel_test_mode != test_mode || test_windows != test_mode ||
+            p.test_stats.bytes != (test_mode == 1 ? 411640 : 513640) || p.stats.flushes)
+            fail("direct color test stats/hold must be separate from normal flushes");
+        unsigned before = test_calls;
+        if (co5300fb_flush(&info, 0, p.height - 1) || test_calls != before || p.stats.flushes ||
+            p.render_stats.samples) fail("pending cursor must not overwrite a held pattern");
+        char buf[4096];
+        if (panel_test_stats_show(dev, NULL, buf) <= 0 || !strstr(buf, "active=Y") ||
+            !strstr(buf, "errors=0")) fail("direct test read-only stats");
+        testing_panel = false;
+        unsigned refresh_before = refreshes;
+        if (panel_test_store(dev, NULL, "0", 1) != 1 || p.panel_test_active ||
+            refreshes != refresh_before + 1) fail("release must request canonical framebuffer redraw");
+    }
+    testing_panel = true;
+    for (test_mode = 1; test_mode <= 2; test_mode++) {
+        for (test_fail = 1; test_fail <= test_mode * 3; test_fail++) {
+            test_calls = test_phase = test_windows = 0;
+            const char *request = test_mode == 1 ? "1" : "2";
+            unsigned before = refreshes;
+            if (panel_test_store(dev, NULL, request, 1) != -EIO || p.panel_test_active ||
+                p.test_stats.last_error != -EIO || refreshes != before + 1)
+                fail("direct transfer failure must propagate and restore fbdev");
+        }
+    }
+    testing_panel = false; test_fail = 0; test_calls = 0;
+    if (panel_test_store(dev, NULL, "3", 1) != -EINVAL ||
+        panel_test_store(dev, NULL, "bad", 3) != -EINVAL || test_calls)
+        fail("invalid direct test request must not send commands");
+    te_off = true;
+    unsigned before = refreshes;
+    if (panel_te_off_store(dev, NULL, "1", 1) != 1 || test_calls != 1 ||
+        p.quiet_commands || refreshes != before + 1) fail("explicit TE-off and redraw");
+    test_fail = 1;
+    if (panel_te_off_store(dev, NULL, "1", 1) != -EIO || p.quiet_commands)
+        fail("TE-off error/quiet flag recovery");
+    if (panel_te_off_store(dev, NULL, "0", 1) != -EINVAL)
+        fail("invalid TE-off request");
+    te_off = false; test_fail = 0;
+    reinitializing = true; init_calls = init_fail = reset_calls = reset_us = sleep_ms = 0;
+    before = refreshes;
+    if (panel_reinit_store(dev, NULL, "1", 1) != 1 || init_calls != 9 || reset_calls != 1 ||
+        reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 || p.quiet_commands ||
+        refreshes != before + 1) fail("full manual reset + supplier delay/order + redraw");
+    for (init_fail = 1; init_fail <= 9; init_fail++) {
+        reinitializing = true; init_calls = 0;
+        p.panel_test_active = true; p.panel_test_mode = 1;
+        if (panel_reinit_store(dev, NULL, "1", 1) != -EIO ||
+            init_calls != init_fail || p.panel_test_active || p.quiet_commands)
+            fail("supplier command failure must restore canonical display mode");
+    }
+    reinitializing = true; init_fail = init_calls = 0; reset_fail = -EIO;
+    if (panel_reinit_store(dev, NULL, "1", 1) != -EIO || init_calls || p.quiet_commands)
+        fail("reset error must propagate before commands");
+    reset_fail = 0; custom_init = true;
+    if (panel_reinit_store(dev, NULL, "1", 1) != -EINVAL || init_calls || p.quiet_commands)
+        fail("invalid supplier sequence must be rejected before any command");
+    custom_init = false; reinitializing = false;
+    if (panel_reinit_store(dev, NULL, "0", 1) != -EINVAL)
+        fail("invalid reinit request");
+    /* Successful reinit replays an active direct pattern without fbdev. */
+    testing_panel = true;
+    for (test_mode = 1; test_mode <= 2; test_mode++) {
+        test_calls = test_phase = test_windows = 0;
+        const char *request = test_mode == 1 ? "1" : "2";
+        if (panel_test_store(dev, NULL, request, 1) != 1) fail("hold pattern before reinit");
+        reinitializing = true; init_calls = 0; test_calls = test_phase = test_windows = 0;
+        if (panel_reinit_store(dev, NULL, "1", 1) != 1 || !p.panel_test_active ||
+            test_windows != test_mode || p.quiet_commands) fail("reinit must replay held direct pattern");
+    }
+    reinitializing = true; init_calls = test_calls = test_phase = test_windows = 0; test_fail = 1;
+    if (panel_reinit_store(dev, NULL, "1", 1) != -EIO || p.panel_test_active || p.quiet_commands)
+        fail("reinit replay failure must propagate and release hold");
+    test_fail = 0;
+    testing_panel = false;
+    panel_test_store(dev, NULL, "0", 1);
+    free(p.command); free(p.pixels);
+}
 static void capture(u32 first, u32 last) {
     calls = phase = retries = 0;
     first_want = first;
@@ -386,19 +564,22 @@ static void geometry(u32 w, u32 h, u32 rot) {
 int main(void) {
     settings();
     for (u32 rot = 0; rot <= 270; rot += 90) {
+        direct_panel(rot);
         geometry(rot % 180 ? 410 : 502, rot % 180 ? 502 : 410, rot);
         geometry(2, 2, rot);
         geometry(512, 512, rot);
     }
     puts("PASS: default full refresh and opt-in partial/mmap windows at all rotations, RGB565 rotation,"
-         " mixed-lane CS, tile edges, retry, render diagnostics and panel resume/error/reset checks");
+         " mixed-lane CS, direct patterns/hold/release/errors, full reinit/TE-off and render diagnostics");
     return 0;
 }
 """
 program = "\n".join([
     header, block("struct co5300fb_stats {"), block("struct co5300fb_render_stats {"),
+    block("struct co5300fb_panel_test_stats {"),
     block("struct co5300fb {"), stub,
     block("static int co5300fb_command("),
+    block("static int co5300fb_write_window("),
     block("static void co5300fb_render("),
     block("static void co5300fb_measure_render("),
     block("static int co5300fb_flush("),
@@ -407,6 +588,14 @@ program = "\n".join([
     block("static ssize_t rotation_show("),
     block("static ssize_t rotation_store("),
     block("static ssize_t panel_resume_store("),
+    block("static void co5300fb_test_fill("),
+    block("static int co5300fb_panel_test_locked("),
+    block("static ssize_t panel_test_store("),
+    block("static ssize_t panel_test_stats_show("),
+    block("static ssize_t panel_te_off_store("),
+    block("static int co5300fb_init_sequence("),
+    block("static int co5300fb_reset_and_init("),
+    block("static ssize_t panel_reinit_store("),
     block("static void co5300fb_deferred_io("), main,
 ])
 with tempfile.TemporaryDirectory(prefix="co5300-windows-") as temp:

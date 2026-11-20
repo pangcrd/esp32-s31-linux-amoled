@@ -43,6 +43,13 @@ struct co5300fb_stats {
 	u32 first, last, bytes;
 };
 
+struct co5300fb_panel_test_stats {
+	u64 runs, errors;
+	u32 mode, windows, bytes, cfirst, clast, rfirst, rlast;
+	u16 color;
+	int last_error;
+};
+
 struct co5300fb {
 	struct spi_device *spi;
 	struct gpio_desc *reset;
@@ -50,10 +57,13 @@ struct co5300fb {
 	spinlock_t damage_lock;
 	struct mutex io_lock; /* Serialize complete windows and runtime settings. */
 	bool dirty, stopped;
+	bool panel_test_active, quiet_commands; /* Protected by io_lock. */
+	u32 panel_test_mode;
 	u32 first, last, width, height, xoff, yoff;
 	u32 rotation;
 	struct co5300fb_stats stats; /* Protected by damage_lock. */
 	struct co5300fb_render_stats render_stats; /* Protected by io_lock. */
+	struct co5300fb_panel_test_stats test_stats; /* Protected by io_lock. */
 	u32 palette[16];
 	u8 *command, *pixels;
 };
@@ -78,12 +88,46 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 		int ret = spi_sync_transfer(p->spi, &t, 1);
 
 		/* Row commands must not feed printk back into fbcon redraws. */
-		if (cmd != 0x2a && cmd != 0x2b)
+		if (!p->quiet_commands && cmd != 0x2a && cmd != 0x2b)
 			dev_info(&p->spi->dev,
 				 "DIAG cmd 0x%02x len %zu tx=%*ph -> %d\n",
 				 cmd, len, (int)(4 + len), p->command, ret);
 		return ret;
 	}
+}
+
+/* Shared by normal fbdev flushes and direct panel tests. Caller holds io_lock.
+ * Keep one CS assertion across the single-lane RAMWR header and quad payload;
+ * the SPI core splits the payload at the controller's existing DMA limit. */
+static int co5300fb_write_window(struct co5300fb *p, u32 cfirst, u32 clast,
+				 u32 rfirst, u32 rlast, u32 bytes)
+{
+	u8 address[4];
+	struct spi_transfer t[2] = {
+		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
+		{ .tx_buf = p->pixels, .len = bytes, .tx_nbits = SPI_NBITS_QUAD },
+	};
+	int ret;
+
+	address[0] = cfirst >> 8;
+	address[1] = cfirst;
+	address[2] = clast >> 8;
+	address[3] = clast;
+	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
+	if (ret)
+		return ret;
+	address[0] = rfirst >> 8;
+	address[1] = rfirst;
+	address[2] = rlast >> 8;
+	address[3] = rlast;
+	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
+	if (ret)
+		return ret;
+	p->command[0] = 0x32;
+	p->command[1] = 0;
+	p->command[2] = 0x2c;
+	p->command[3] = 0;
+	return spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
 }
 
 /*
@@ -200,17 +244,18 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
 	u32 cfirst, clast, rfirst, rlast;
-	u8 address[4];
-	struct spi_transfer t[2] = {
-		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
-		{ .tx_buf = p->pixels, .len = p->width * (last - first + 1) * 2,
-		  .tx_nbits = SPI_NBITS_QUAD },
-	};
+	u32 bytes = p->width * (last - first + 1) * 2;
 	u64 begin, rendered, finish;
 	unsigned long flags;
 	int ret;
 
 	mutex_lock(&p->io_lock);
+	/* A held direct pattern must survive pending fbcon/cursor work. Writes
+	 * still update screen_buffer; releasing the test requests a full redraw. */
+	if (p->panel_test_active) {
+		mutex_unlock(&p->io_lock);
+		return 0;
+	}
 	begin = ktime_get_ns();
 	if (p->rotation == 90 || p->rotation == 270) {
 		cfirst = p->yoff;
@@ -227,34 +272,14 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 	if (READ_ONCE(render_diagnostics))
 		co5300fb_measure_render(info, first, last);
 	rendered = ktime_get_ns();
-	address[0] = cfirst >> 8;
-	address[1] = cfirst;
-	address[2] = clast >> 8;
-	address[3] = clast;
-	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
-	if (ret)
-		goto done;
-	address[0] = rfirst >> 8;
-	address[1] = rfirst;
-	address[2] = rlast >> 8;
-	address[3] = rlast;
-	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
-	if (ret)
-		goto done;
-	p->command[0] = 0x32;
-	p->command[1] = 0;
-	p->command[2] = 0x2c;
-	p->command[3] = 0;
-	/* CS stays asserted across the single-lane header and quad payload. */
-	ret = spi_sync_transfer(p->spi, t, ARRAY_SIZE(t));
-done:
+	ret = co5300fb_write_window(p, cfirst, clast, rfirst, rlast, bytes);
 	finish = ktime_get_ns();
 	spin_lock_irqsave(&p->damage_lock, flags);
 	p->stats.flushes++;
 	p->stats.errors += !!ret;
 	p->stats.first = first;
 	p->stats.last = last;
-	p->stats.bytes = t[1].len;
+	p->stats.bytes = bytes;
 	p->stats.render_us = div_u64(rendered - begin, 1000);
 	p->stats.spi_us = div_u64(finish - rendered, 1000);
 	p->stats.total_us = div_u64(finish - begin, 1000);
@@ -319,6 +344,146 @@ static DEVICE_ATTR_RO(render_stats);
 
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
 			    unsigned long delay);
+
+static void co5300fb_test_fill(struct co5300fb *p, u32 bytes, u16 color)
+{
+	u32 i;
+
+	for (i = 0; i < bytes; i += 2) {
+		p->pixels[i] = color >> 8;
+		p->pixels[i + 1] = color;
+	}
+}
+
+/* Direct GRAM writes: never read/modify screen_buffer or call the renderer. */
+static int co5300fb_panel_test_locked(struct fb_info *info, u32 mode)
+{
+	struct co5300fb *p = info->par;
+	struct co5300fb_panel_test_stats *s = &p->test_stats;
+	bool portrait = p->rotation == 90 || p->rotation == 270;
+	u32 columns = portrait ? p->width : p->height;
+	u32 rows = portrait ? p->height : p->width;
+	u32 bytes = p->width * p->height * 2;
+	int ret;
+
+	p->panel_test_active = true;
+	p->panel_test_mode = mode;
+	s->runs++;
+	s->mode = mode;
+	s->windows = 0;
+	s->bytes = 0;
+	s->last_error = 0;
+	s->cfirst = p->yoff;
+	s->clast = p->yoff + columns - 1;
+	s->rfirst = p->xoff;
+	s->rlast = p->xoff + rows - 1;
+	s->color = mode == 1 ? 0xf800 : 0;
+	co5300fb_test_fill(p, bytes, s->color);
+	ret = co5300fb_write_window(p, s->cfirst, s->clast, s->rfirst, s->rlast, bytes);
+	if (ret)
+		goto error;
+	s->windows++;
+	s->bytes += bytes;
+	if (mode == 2) {
+		u32 cw = max_t(u32, 2, (columns / 2) & ~1U);
+		u32 rh = max_t(u32, 2, (rows / 2) & ~1U);
+
+		s->cfirst = p->yoff + (((columns - cw) / 2) & ~1U);
+		s->clast = s->cfirst + cw - 1;
+		s->rfirst = p->xoff + (((rows - rh) / 2) & ~1U);
+		s->rlast = s->rfirst + rh - 1;
+		s->color = 0x07e0;
+		bytes = cw * rh * 2;
+		co5300fb_test_fill(p, bytes, s->color);
+		ret = co5300fb_write_window(p, s->cfirst, s->clast, s->rfirst, s->rlast, bytes);
+		if (ret)
+			goto error;
+		s->windows++;
+		s->bytes += bytes;
+	}
+	return 0;
+error:
+	s->errors++;
+	s->last_error = ret;
+	p->panel_test_active = false;
+	p->panel_test_mode = 0;
+	co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+	return ret;
+}
+
+static ssize_t panel_test_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 mode;
+	int ret = 0;
+
+	if (kstrtou32(buf, 10, &mode) || mode > 2)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	if (!mode) {
+		p->panel_test_active = false;
+		p->panel_test_mode = 0;
+		co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+	} else {
+		ret = co5300fb_panel_test_locked(info, mode);
+	}
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(panel_test);
+
+static ssize_t panel_test_stats_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	struct co5300fb_panel_test_stats s;
+	u32 mode;
+	bool active;
+
+	mutex_lock(&p->io_lock);
+	s = p->test_stats;
+	mode = p->panel_test_mode;
+	active = p->panel_test_active;
+	mutex_unlock(&p->io_lock);
+	return sysfs_emit(buf,
+		"active=%c mode=%u last_mode=%u runs=%llu errors=%llu last_error=%d\n"
+		"windows=%u bytes=%u columns=%u..%u rows=%u..%u color_rgb565=%04x\n",
+		active ? 'Y' : 'N', mode, s.mode, s.runs, s.errors, s.last_error,
+		s.windows, s.bytes, s.cfirst, s.clast, s.rfirst, s.rlast, s.color);
+}
+static DEVICE_ATTR_RO(panel_test_stats);
+
+/* DCS 35h with M=0 enables vertical-blank TE output; 34h is actual TE-off. */
+static ssize_t panel_te_off_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 request;
+	int ret;
+
+	if (kstrtou32(buf, 10, &request) || request != 1)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	p->quiet_commands = true;
+	ret = co5300fb_command(p, 0x34, NULL, 0);
+	p->quiet_commands = false;
+	if (!ret)
+		co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(panel_te_off);
+
+static ssize_t panel_reinit_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count);
+static DEVICE_ATTR_WO(panel_reinit);
 
 /* Explicit recovery experiment only: a black RAMWR does not itself send
  * sleep/display-off commands. Do not silently reinitialize a healthy panel. */
@@ -430,6 +595,10 @@ static struct attribute *co5300fb_attrs[] = {
 	&dev_attr_flush_stats.attr,
 	&dev_attr_render_stats.attr,
 	&dev_attr_panel_resume.attr,
+	&dev_attr_panel_test.attr,
+	&dev_attr_panel_test_stats.attr,
+	&dev_attr_panel_te_off.attr,
+	&dev_attr_panel_reinit.attr,
 	&dev_attr_spi_freq_hz.attr,
 	&dev_attr_rotation.attr,
 	NULL,
@@ -622,6 +791,55 @@ static int co5300fb_init_sequence(struct co5300fb *p)
 	return 0;
 }
 
+/* Exact probe reset and supplier sequence, also available for manual recovery. */
+static int co5300fb_reset_and_init(struct co5300fb *p)
+{
+	int ret;
+
+	ret = gpiod_direction_output_raw(p->reset, 0);
+	if (ret)
+		return ret;
+	usleep_range(10000, 11000);
+	gpiod_set_raw_value_cansleep(p->reset, 1);
+	if (!p->quiet_commands)
+		dev_info(&p->spi->dev, "reset released, RST raw value=%d (want 1)\n",
+			 gpiod_get_raw_value_cansleep(p->reset));
+	msleep(150);
+	ret = co5300fb_init_sequence(p);
+	if (ret)
+		return ret;
+	return co5300fb_command(p, 0x29, NULL, 0);
+}
+
+static ssize_t panel_reinit_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 request;
+	int ret;
+
+	if (kstrtou32(buf, 10, &request) || request != 1)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	/* Keep recovery printk out of the login framebuffer. */
+	p->quiet_commands = true;
+	ret = co5300fb_reset_and_init(p);
+	p->quiet_commands = false;
+	if (!ret && p->panel_test_active) {
+		ret = co5300fb_panel_test_locked(info, p->panel_test_mode);
+	} else {
+		if (ret) {
+			p->panel_test_active = false;
+			p->panel_test_mode = 0;
+		}
+		co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+	}
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
+}
+
 static int co5300fb_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
@@ -715,20 +933,9 @@ static int co5300fb_probe(struct spi_device *spi)
 	 * GPIO is flagged ACTIVE LOW. Raw 0 = physical 0 V = reset
 	 * asserted; raw 1 = physical 3.3 V = reset released. The
 	 * readback below proves the release in dmesg. */
-	ret = gpiod_direction_output_raw(p->reset, 0);
-	if (ret)
-		goto cleanup;
-	usleep_range(10000, 11000);
-	gpiod_set_raw_value_cansleep(p->reset, 1);
-	dev_info(dev, "reset released, RST raw value=%d (want 1)\n",
-		 gpiod_get_raw_value(p->reset));
-	msleep(150);
 	/* Init sequence (supplier order, incl. 0x3a=0x55 and the 0x35
 	 * data byte) then Display On. */
-	ret = co5300fb_init_sequence(p);
-	if (ret)
-		goto cleanup;
-	ret = co5300fb_command(p, 0x29, NULL, 0);
+	ret = co5300fb_reset_and_init(p);
 	if (ret)
 		goto cleanup;
 	spi_set_drvdata(spi, info);
