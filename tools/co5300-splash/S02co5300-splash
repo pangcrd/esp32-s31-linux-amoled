@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# rcS completes before PID 1 starts getty. A splash error must not block boot.
+case "${1:-}" in
+start)
+	ENABLED=0
+	[ ! -r /etc/default/co5300-splash ] || . /etc/default/co5300-splash
+	[ "$ENABLED" = 1 ] || exit 0
+	[ -e /dev/fb0 ] && [ -r "$IMAGE" ] || exit 0
+	/usr/bin/co5300-splash "$IMAGE" "$WIDTH" "$HEIGHT" "$SECONDS" ||
+		printf '%s\n' 'co5300-splash: skipped; continuing boot' >&2
+	;;
+stop) ;;
+*) printf 'Usage: %s {start|stop}\n' "$0" >&2; exit 1 ;;
+esac
+exit 0

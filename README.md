@@ -20,6 +20,8 @@ release.
 
 For the CO5300 QSPI AMOLED shield, see
 [the SPI investigation and opt-in boot console](docs/amoled-spi-debug.md).
+Runtime clock/rotation controls and kernel/custom boot logos are described in
+[the CO5300 configuration and logo guide](docs/co5300-config-logo.md).
 The [two-row window fix and board-test procedure](docs/co5300-black-screen-analysis.md)
 address the remaining black screen.
 

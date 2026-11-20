@@ -1,0 +1,5 @@
+config BR2_PACKAGE_CO5300_SPLASH
+	bool "CO5300 boot splash"
+	help
+	  One-shot RGB565 splash for the opt-in CO5300 framebuffer console.
+	  Displays a centered image with a 40-pixel inset before getty starts.
