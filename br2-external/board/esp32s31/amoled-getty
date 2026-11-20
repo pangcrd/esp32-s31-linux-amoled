@@ -1,13 +1,35 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
+# Keep the working boot frame visible while fbcon clears and splash writes
+# the login framebuffer. Release sends one complete frame before getty.
+panel=/sys/class/graphics/fb0/device
+held=0
+release_update() {
+	if [ "$held" = 1 ]; then
+		printf '0\n' > "$panel/update_hold" ||
+			printf '%s\n' 'amoled-getty: display update failed; continuing login' >&2
+		held=0
+	fi
+}
+trap release_update EXIT
+trap 'release_update; exit 1' HUP INT TERM
+if [ -w "$panel/update_hold" ]; then
+	# Arm cleanup before the write so a signal cannot strand an active hold.
+	held=1
+	if ! printf '1\n' > "$panel/update_hold"; then
+		held=0
+	fi
+fi
 # PID 1 starts this through inittab. Clear BEFORE getty prints its prompt.
 printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
-# Push the login banner down 3 lines so it clears the panel's rounded
-# top corners (40 px safe inset); the console itself stays full-screen.
-printf '\n\n\n' > /dev/tty0
+# BusyBox print_login_issue adds a newline before /etc/issue. Two here
+# put the banner on row 3 (y=66) and prompt on row 4 (y=88..109), above Tux.
+printf '\n\n' > /dev/tty0
 # Draw below the banner/prompt before getty, without a VT switch or clear.
 # The 230x240 image at (150,120) stays inside the 40 px safe inset.
 /usr/bin/co5300-splash --at 150,120 --persist \
 	/usr/share/co5300-splash/tux.rgb565 230 240 ||
 	printf '%s\n' 'amoled-getty: penguin unavailable; continuing login' >&2
+release_update
+trap - EXIT HUP INT TERM
 exec /sbin/getty -L tty0 115200 vt100

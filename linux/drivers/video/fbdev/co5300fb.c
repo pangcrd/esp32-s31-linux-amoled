@@ -58,6 +58,7 @@ struct co5300fb {
 	struct mutex io_lock; /* Serialize complete windows and runtime settings. */
 	bool dirty, stopped;
 	bool panel_test_active, quiet_commands; /* Protected by io_lock. */
+	bool update_held; /* Assemble a framebuffer without showing partial stages. */
 	u32 panel_test_mode;
 	u32 first, last, width, height, xoff, yoff;
 	u32 rotation;
@@ -296,11 +297,43 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 	mutex_lock(&p->io_lock);
 	/* A held direct pattern must survive pending fbcon/cursor work. Writes
 	 * still update screen_buffer; releasing the test requests a full redraw. */
-	if (!p->panel_test_active)
+	if (!p->panel_test_active && !p->update_held)
 		ret = co5300fb_flush_locked(info, first, last);
 	mutex_unlock(&p->io_lock);
 	return ret;
 }
+
+/* Hold display updates only; fbcon and /dev/fbN keep drawing into RAM.
+ * Release submits the complete current framebuffer, never a cached clear. */
+static ssize_t update_hold_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 request;
+	int ret = 0;
+
+	if (kstrtou32(buf, 10, &request) || request > 1)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	if (request) {
+		p->update_held = true;
+	} else if (p->update_held) {
+		if (!info->screen_buffer || !p->pixels || !p->command) {
+			ret = -ENODEV;
+			goto out;
+		}
+		p->update_held = false;
+		/* An explicit panel_test continues to own GRAM until released. */
+		if (!p->panel_test_active)
+			ret = co5300fb_flush_locked(info, 0, p->height - 1);
+	}
+out:
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(update_hold);
 
 /* Reading stats must not printk into fbcon and trigger more display work. */
 static ssize_t flush_stats_show(struct device *dev,
@@ -604,6 +637,7 @@ static ssize_t rotation_store(struct device *dev,
 static DEVICE_ATTR_RW(rotation);
 
 static struct attribute *co5300fb_attrs[] = {
+	&dev_attr_update_hold.attr,
 	&dev_attr_flush_stats.attr,
 	&dev_attr_render_stats.attr,
 	&dev_attr_panel_resume.attr,

@@ -3,13 +3,20 @@
 Boot is plain text: kernel `CONFIG_LOGO` is disabled and the optional
 `S02co5300-splash` service defaults to `ENABLED=0`.
 
-`amoled-getty` clears to black, prints three blank lines, then runs:
+`amoled-getty` starts a framebuffer update transaction through
+`/sys/class/graphics/fb0/device/update_hold`, clears to black in memory,
+prints two blank lines, then runs:
 
 ```sh
 co5300-splash --at 150,120 --persist /usr/share/co5300-splash/tux.rgb565 230 240
 ```
 
-It then execs getty even if drawing fails. The image occupies x=150..379,
+It releases the transaction with one synchronous full-frame transfer before
+execing getty, even if drawing fails; interruption also releases the hold.
+The working boot display stays visible while the clear and image are prepared,
+so neither an intermediate black clear nor partial image rows are submitted.
+With an older kernel lacking the control it uses the ordinary drawing path.
+The image occupies x=150..379,
 y=120..359, inside the 40-pixel safe inset on the 502x410 landscape framebuffer.
 Portrait mode rejects this fixed position safely and still starts getty.
 
@@ -17,11 +24,15 @@ Framebuffer writes use `lseek` + `write`, including short-write handling.
 The tool reads back every target row and calls `fsync` to drain kernel deferred
 I/O before reporting success. A mismatched readback or failed sync reports an
 error and the wrapper continues to getty. This verifies the pixels in memory
-and completion of scheduled work; actual panel visibility needs board testing.
+and completion of scheduled work. During the wrapper transaction, scheduled
+work consumes damage without submitting intermediate pixels; releasing the
+transaction renders the full current framebuffer even if its damage has already
+been consumed. Actual panel visibility needs board testing.
 
 `--persist` validates the image, fbdev format, position and current text VT,
 writes only the image rectangle using the framebuffer stride, and exits. It
-does not clear, sleep, or change/restore the VT mode. SUN12x22 banner/prompt
+does not clear, sleep, or change/restore the VT mode. BusyBox getty adds a
+newline before `/etc/issue`: two wrapper newlines put the SUN12x22 banner/prompt
 glyphs and cursor updates on rows 3/4 touch y=66..109, so normal prompt typing,
 backspace and idle cursor blinking leave Tux intact. A full clear, VT switch,
 scroll or input wrapping into the image can replace it; it is drawn again on

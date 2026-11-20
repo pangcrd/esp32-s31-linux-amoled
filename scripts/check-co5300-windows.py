@@ -494,6 +494,61 @@ static void capture(u32 first, u32 last) {
     first_want = first;
     last_want = last;
 }
+static void update_transaction(struct fb_info *info) {
+    struct co5300fb *p = info->par;
+    struct device *dev = &p->spi->dev;
+    struct list_head pages = {0};
+    capture(0, p->height - 1);
+    unsigned before = refreshes;
+    if (update_hold_store(dev, NULL, "1\n", 2) != 2 || !p->update_held || calls)
+        fail("starting a framebuffer transaction must send no pixels or commands");
+    memset(info->screen_buffer, 0, p->width * p->height * 2);
+    p->dirty = true; p->first = 0; p->last = p->height - 1;
+    co5300fb_deferred_io(info, &pages);
+    if (calls || p->stats.flushes || p->dirty)
+        fail("intermediate clear callback must consume damage without submitting black");
+    if (update_hold_store(dev, NULL, "1", 1) != 1 || calls)
+        fail("repeated hold must not send a frame");
+    const char *invalid[] = { "2", "-1", "0x0", "bad", "", "4294967296" };
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++)
+        if (update_hold_store(dev, NULL, invalid[i], strlen(invalid[i])) != -EINVAL ||
+            !p->update_held || calls)
+            fail("invalid update transaction must leave the hold intact");
+    for (unsigned i = 0; i < 3; i++) {
+        char *fb = info->screen_buffer; u8 *pixels = p->pixels, *command = p->command;
+        if (i == 0) info->screen_buffer = NULL;
+        if (i == 1) p->pixels = NULL;
+        if (i == 2) p->command = NULL;
+        if (update_hold_store(dev, NULL, "0", 1) != -ENODEV || !p->update_held || calls)
+            fail("missing release buffers must preserve the transaction");
+        info->screen_buffer = fb; p->pixels = pixels; p->command = command;
+    }
+    for (u32 y = 0; y < p->height; y++)
+        for (u32 x = 0; x < p->width; x++)
+            ((u16 *)info->screen_buffer)[y * p->width + x] = pattern(y, x);
+    /* No pending damage remains: release must still submit the live frame. */
+    if (update_hold_store(dev, NULL, "0\n", 2) != 2 || p->update_held || calls != 3 ||
+        phase != 3 || p->stats.full_flushes != 1 || refreshes != before)
+        fail("transaction commit must synchronously send current content without deferred work");
+    if (update_hold_store(dev, NULL, "0", 1) != 1 || calls != 3)
+        fail("inactive release must send nothing");
+    p->panel_test_active = true;
+    update_hold_store(dev, NULL, "1", 1);
+    if (update_hold_store(dev, NULL, "0", 1) != 1 || p->update_held ||
+        !p->panel_test_active || calls != 3)
+        fail("transaction release must preserve an explicitly held direct pattern");
+    p->panel_test_active = false;
+    for (injected = 1; injected <= 3; injected++) {
+        capture(0, p->height - 1);
+        update_hold_store(dev, NULL, "1", 1);
+        if (update_hold_store(dev, NULL, "0", 1) != -EIO || p->update_held ||
+            calls != injected || p->stats.errors != injected || p->stats.full_flushes != 1)
+            fail("release failures must propagate and enable subsequent normal updates");
+    }
+    injected = 0;
+    p->stats = (struct co5300fb_stats) {0};
+    p->render_stats = (struct co5300fb_render_stats) {0};
+}
 static ssize_t draw_attempt(struct fb_info *info, const char *request) {
     struct co5300fb *p = info->par;
     reinitializing = synchronous_draw = true;
@@ -599,6 +654,7 @@ static void geometry(u32 w, u32 h, u32 rot) {
     struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
                            .fix = { .line_length = w*2, .smem_len = w*h*2 } };
     spi.data = &info;
+    update_transaction(&info);
     synchronous_recovery(&info);
     struct list_head pages = {0};
     partial_updates = false;
@@ -673,6 +729,8 @@ int main(void) {
     puts("PASS: default full refresh and opt-in partial/mmap windows at all rotations, RGB565 rotation,"
          " mixed-lane CS, direct patterns/hold/release/errors, fallback + board DT TE-off,"
          " synchronous reinit_draw under one lock without deferred work, errors and render diagnostics");
+    puts("PASS: update_hold suppresses intermediate black clears and commits the live full frame,"
+         " including consumed damage, idempotency, validation, errors and direct-pattern coexistence");
     return 0;
 }
 """
@@ -688,6 +746,7 @@ program = "\n".join([
     block("static void co5300fb_measure_render("),
     block("static int co5300fb_flush_locked("),
     block("static int co5300fb_flush("),
+    block("static ssize_t update_hold_store("),
     block("static ssize_t spi_freq_hz_show("),
     block("static ssize_t spi_freq_hz_store("),
     block("static ssize_t rotation_show("),
