@@ -341,6 +341,8 @@ int main(int argc, char **argv) {
         scheduled != queued || !info.deferred_work.pending || !p.dirty ||
         p.panel_test_active || p.panel_test_mode || p.quiet_commands ||
         p.stats.full_flushes != full_flushes + 1 || p.stats.errors ||
+        !p.trace_count || p.trace[p.trace_count - 1].source != 'R' ||
+        p.trace[p.trace_count - 1].bytes != 411640 || p.trace[p.trace_count - 1].ret ||
         p.render_stats.fb_sample != 0xffff || p.render_stats.tx_sample != 0xffff ||
         p.render_stats.sample_offset != 217638)
         fail("one-lock synchronous reset/init must submit the actual Tux before returning and preserve pending damage");
@@ -378,11 +380,25 @@ int main(int argc, char **argv) {
     if (info.fbops->fb_write(&info, white, 8, &pos) >= 0 || p.dirty) fail("invalid offset must not mark damage");
     struct fb_deferred_io_pageref page = { .offset = 241490 & ~4095U };
     pages.first = &page; drain(&info, &pages);
+    pages.first = NULL;
+    render_diagnostics = false;
+    u64 measured_before = p.render_stats.samples;
+    update_hold_store(&spi.dev, NULL, "1", 1); phase = 0;
+    if (update_hold_store(&spi.dev, NULL, "0", 1) != 1 || p.trace_count != 2 ||
+        !p.trace[1].nonzero || p.trace[1].tx_sample != 0xffff || p.trace[1].source != 'H')
+        fail("trace release must retain the complete actual Tux payload");
+    info.fbops->fb_fillrect(&info, &clear); drain(&info, &pages);
+    if (p.trace_count != 3 || p.trace[2].source != 'D' || p.trace[2].nonzero ||
+        p.trace[2].fb_sample || p.trace[2].tx_sample || p.trace[2].ret ||
+        p.trace[2].damage_first || p.trace[2].damage_last != 409 ||
+        p.render_stats.samples != measured_before)
+        fail("trace must distinguish an actual sys_fillrect erasing Tux from a successful Tux release");
     free(white); free(readback); free(tux); co5300fb_destroy(&info);
     puts("PASS: actual Linux sysmem/deferred macros, 8-byte/full-frame/Tux writes and readback,"
          " synchronous one-lock reset/init/Tux RAMWR before return with pending work preserved,"
          " atomic clear + 240 Tux row writes with callbacks between every row,"
          " glyph/fill/copy damage, held-pattern canonical restoration, mmap pages and full-frame RGB565 SPI");
+    puts("PASS: trace of actual Tux release followed by actual sys_fillrect black frame, independent of render_stats");
     return 0;
 }
 '''
@@ -400,10 +416,13 @@ for name in ("fb_sys_read", "fb_sys_write"):
 for file, name in (("sysimgblt.c", "sys_imageblit"), ("sysfillrect.c", "sys_fillrect"),
                    ("syscopyarea.c", "sys_copyarea")):
     program.append(block((core / file).read_text(), name))
-program += [macros, block(driver, "struct co5300fb_stats {"),
+program += [macros, re.search(r"^#define CO5300FB_TRACE_EVENTS .*", driver, re.M)[0],
+            block(driver, "struct co5300fb_trace_event {"), block(driver, "struct co5300fb_stats {"),
             block(driver, "struct co5300fb_render_stats {"),
             block(driver, "struct co5300fb_panel_test_stats {"), block(driver, "struct co5300fb {")]
-for name in ("co5300fb_command", "co5300fb_write_window", "co5300fb_render", "co5300fb_measure_render",
+for name in ("co5300fb_trace_event", "co5300fb_trace_start", "co5300fb_trace_command", "co5300fb_trace_reset",
+             "co5300fb_command", "co5300fb_write_window", "co5300fb_render",
+             "co5300fb_sample_render", "co5300fb_measure_render", "co5300fb_trace_frame",
              "co5300fb_flush_locked", "co5300fb_flush", "update_hold_store", "co5300fb_init_sequence",
              "co5300fb_reset_and_init", "panel_reinit_draw_store", "co5300fb_damage",
              "co5300fb_damage_range", "co5300fb_damage_area"):

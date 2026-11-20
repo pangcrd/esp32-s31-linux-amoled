@@ -74,6 +74,14 @@ static int sysfs_emit(char *buf, const char *fmt, ...) {
     va_end(ap);
     return n;
 }
+static int sysfs_emit_at(char *buf, int at, const char *fmt, ...) {
+    if (at < 0 || at >= 4096) { fprintf(stderr, "FAIL: sysfs offset\n"); exit(2); }
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf + at, 4096 - at, fmt, ap);
+    va_end(ap);
+    if (n >= 4096 - at) { fprintf(stderr, "FAIL: trace exceeds sysfs page\n"); exit(2); }
+    return n;
+}
 static int kstrtou32(const char *buf, int base, u32 *value) {
     char *end;
     if (*buf == '-') return -EINVAL;
@@ -140,6 +148,8 @@ static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
 static unsigned int refreshes;
 static bool partial_updates;
 static bool render_diagnostics = true;
+static bool expected_black, trace_command_mode;
+static int trace_command_fail;
 static bool resuming;
 static int reset_raw = 1, resume_fail;
 static unsigned resume_calls, sleep_ms;
@@ -195,6 +205,12 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
     (void)dev;
     if (!locked_mutex) fail("SPI submission must remain under io_lock");
     const u8 *b = t[0].tx_buf;
+    if (trace_command_mode) {
+        if (n != 1 || t[0].len < 4 || b[0] != 2 || b[1] || b[3])
+            fail("traced command framing");
+        test_calls++;
+        return trace_command_fail;
+    }
     if (reinitializing) {
         static const u8 commands[] = { 0x36, 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
         static const u8 values[] = { 0, 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
@@ -300,7 +316,7 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
             case 270: x = width - 1 - c; y = last_want - r; break;
             default: x = r; y = last_want - c; break;
             }
-            u16 expected = pattern(y, x);
+            u16 expected = expected_black ? 0 : pattern(y, x);
             u32 off = (r * columns + c) * 2;
             if (b[off] != (expected >> 8) || b[off+1] != (expected & 255))
                 fail("clockwise rotation / RGB565 wire bytes");
@@ -415,7 +431,8 @@ static void direct_panel(u32 rot) {
             p.test_stats.bytes != (test_mode == 1 ? 411640 : 513640) || p.stats.flushes)
             fail("direct color test stats/hold must be separate from normal flushes");
         unsigned before = test_calls;
-        if (co5300fb_flush(&info, 0, p.height - 1) || test_calls != before || p.stats.flushes ||
+        if (co5300fb_flush(&info, 0, p.height - 1, 0, p.height - 1) ||
+            test_calls != before || p.stats.flushes ||
             p.render_stats.samples) fail("pending cursor must not overwrite a held pattern");
         char buf[4096];
         if (panel_test_stats_show(dev, NULL, buf) <= 0 || !strstr(buf, "active=Y") ||
@@ -494,6 +511,96 @@ static void capture(u32 first, u32 last) {
     first_want = first;
     last_want = last;
 }
+static void trace_history(struct fb_info *info) {
+    struct co5300fb *p = info->par;
+    struct device *dev = &p->spi->dev;
+    struct list_head pages = {0};
+    char buf[4096], saved[4096];
+    capture(0, p->height - 1);
+    if (display_trace_show(dev, NULL, buf) <= 0 || !strstr(buf, "started=N") || calls)
+        fail("reading inactive trace must do no I/O");
+    render_diagnostics = false;
+    update_hold_store(dev, NULL, "1", 1);
+    p->dirty = true; p->first = p->last = 240;
+    co5300fb_deferred_io(info, &pages);
+    if (p->trace_started || p->trace_count || calls) fail("held callback cannot arm or add frame events");
+    if (update_hold_store(dev, NULL, "0", 1) != 1 || p->trace_count != 2 ||
+        p->trace[0].type != 'H' || p->trace[1].type != 'F' || p->trace[1].source != 'H' ||
+        !p->trace[1].nonzero || p->trace[1].ret || p->trace[1].flush != 1 ||
+        p->trace[1].tx_sample != pattern(240,265) || p->render_stats.samples)
+        fail("release must arm and capture the exact nonzero payload independently of render_stats");
+    memset(info->screen_buffer, 0, p->width * p->height * 2);
+    expected_black = true; partial_updates = false;
+    capture(0, p->height - 1);
+    p->dirty = true; p->first = p->last = 240;
+    co5300fb_deferred_io(info, &pages);
+    struct co5300fb_trace_event *e = &p->trace[2];
+    if (e->type != 'F' || e->source != 'D' || e->first || e->last != 409 ||
+        e->damage_first != 240 || e->damage_last != 240 || e->bytes != 411640 ||
+        e->nonzero || !e->hash || e->fb_sample || e->tx_sample || !e->sample_valid ||
+        e->ret || e->flush != 2 || p->render_stats.samples)
+        fail("trace must identify a later black frame and retain pre-expansion damage");
+    trace_command_mode = true;
+    u8 value = 0;
+    mutex_lock(&p->io_lock);
+    co5300fb_command(p, 0x28, NULL, 0);
+    co5300fb_command(p, 0x10, NULL, 0);
+    trace_command_fail = -EIO;
+    co5300fb_command(p, 0x51, &value, 1);
+    mutex_unlock(&p->io_lock);
+    trace_command_mode = false; trace_command_fail = 0;
+    if (p->trace[3].cmd != 0x28 || p->trace[4].cmd != 0x10 ||
+        p->trace[5].cmd != 0x51 || p->trace[5].len != 1 ||
+        p->trace[5].data[0] || p->trace[5].ret != -EIO)
+        fail("off/sleep/brightness commands and failures must survive in trace order");
+    if (display_trace_show(dev, NULL, buf) <= 0 || !strstr(buf, "F:D") ||
+        !strstr(buf, "d=240..240") || !strstr(buf, "nz=0") || !strstr(buf, "cmd=28") ||
+        !strstr(buf, "cmd=10") || !strstr(buf, "cmd=51") || !strstr(buf, "rc=-5"))
+        fail("read-only trace must expose frames and commands");
+    capture(0, p->height - 1);
+    update_hold_store(dev, NULL, "1", 1);
+    update_hold_store(dev, NULL, "0", 1);
+    reinitializing = true; init_calls = init_fail = 0;
+    mutex_lock(&p->io_lock); p->quiet_commands = true;
+    if (co5300fb_reset_and_init(p)) fail("traced supplier init");
+    p->quiet_commands = false; mutex_unlock(&p->io_lock);
+    if (p->trace[2].type != 'X' || p->trace[2].cmd ||
+        p->trace[3].type != 'X' || p->trace[3].cmd != 1 ||
+        p->trace[4].type != 'C' || p->trace[4].cmd != 0x36)
+        fail("trace must preserve reset and complete init command order");
+    for (unsigned i = 0; i < CO5300FB_TRACE_EVENTS + 2; i++) {
+        capture(0, p->height - 1);
+        if (co5300fb_flush(info, 0, p->height - 1, 66, 87)) fail("traced frame");
+    }
+    if (p->trace_count != CO5300FB_TRACE_EVENTS || p->render_stats.samples)
+        fail("capture must stop at its fixed capacity without changing render_stats");
+    display_trace_show(dev, NULL, saved);
+    unsigned old_calls = calls, old_logs = runtime_logs;
+    display_trace_show(dev, NULL, buf);
+    if (strcmp(buf, saved) || calls != old_calls || runtime_logs != old_logs)
+        fail("reading a frozen trace must be stable and never draw or log");
+    capture(0, p->height - 1);
+    co5300fb_flush(info, 0, p->height - 1, 240, 240);
+    display_trace_show(dev, NULL, buf);
+    if (strcmp(buf, saved)) fail("later cursor work must not overwrite first events");
+    /* Maximum valid field widths still fit the one-page sysfs interface. */
+    for (unsigned i = 0; i < CO5300FB_TRACE_EVENTS; i++) {
+        p->trace[i] = (struct co5300fb_trace_event) {
+            .type = 'F', .source = 'D', .ms = UINT64_MAX / 1000000, .flush = UINT64_MAX,
+            .first = 511, .last = 511, .damage_first = 511, .damage_last = 511,
+            .bytes = 524288, .nonzero = 524288, .hash = UINT32_MAX, .rotation = 270,
+            .fb_sample = 65535, .tx_sample = 65535, .sample_valid = true, .ret = INT32_MIN };
+    }
+    if (display_trace_show(dev, NULL, buf) >= 4096) fail("maximum trace size");
+    for (u32 y = 0; y < p->height; y++)
+        for (u32 x = 0; x < p->width; x++)
+            ((u16 *)info->screen_buffer)[y * p->width + x] = pattern(y,x);
+    expected_black = false; render_diagnostics = true;
+    p->trace_started = false; p->trace_count = 0;
+    p->stats = (struct co5300fb_stats) {0};
+    puts("PASS: release -> nonzero frame -> black dirty frame -> off/sleep/brightness trace,"
+         " reset/init ordering, bounded/frozen capture, no read side effects and one-page worst case");
+}
 static void update_transaction(struct fb_info *info) {
     struct co5300fb *p = info->par;
     struct device *dev = &p->spi->dev;
@@ -542,7 +649,8 @@ static void update_transaction(struct fb_info *info) {
         capture(0, p->height - 1);
         update_hold_store(dev, NULL, "1", 1);
         if (update_hold_store(dev, NULL, "0", 1) != -EIO || p->update_held ||
-            calls != injected || p->stats.errors != injected || p->stats.full_flushes != 1)
+            calls != injected || p->stats.errors != injected || p->stats.full_flushes != 1 ||
+            p->trace_count < 2 || p->trace[1].type != 'F' || p->trace[1].ret != -EIO)
             fail("release failures must propagate and enable subsequent normal updates");
     }
     injected = 0;
@@ -654,6 +762,7 @@ static void geometry(u32 w, u32 h, u32 rot) {
     struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
                            .fix = { .line_length = w*2, .smem_len = w*h*2 } };
     spi.data = &info;
+    if (w == 502 && h == 410 && !rot) trace_history(&info);
     update_transaction(&info);
     synchronous_recovery(&info);
     struct list_head pages = {0};
@@ -737,16 +846,25 @@ int main(void) {
 program = "\n".join([
     header.replace("/* BOARD_INIT */", "static const u8 board_init[] = {" +
                    ",".join(str(b) for b in board_init) + "};"),
+    re.search(r"^#define CO5300FB_TRACE_EVENTS .*", source, re.M)[0],
+    block("struct co5300fb_trace_event {"),
     block("struct co5300fb_stats {"), block("struct co5300fb_render_stats {"),
     block("struct co5300fb_panel_test_stats {"),
     block("struct co5300fb {"), stub,
+    block("static struct co5300fb_trace_event *co5300fb_trace_event("),
+    block("static void co5300fb_trace_start("),
+    block("static void co5300fb_trace_command("),
+    block("static void co5300fb_trace_reset("),
     block("static int co5300fb_command("),
     block("static int co5300fb_write_window("),
     block("static void co5300fb_render("),
+    block("static void co5300fb_sample_render("),
     block("static void co5300fb_measure_render("),
+    block("static struct co5300fb_trace_event *co5300fb_trace_frame("),
     block("static int co5300fb_flush_locked("),
     block("static int co5300fb_flush("),
     block("static ssize_t update_hold_store("),
+    block("static ssize_t display_trace_show("),
     block("static ssize_t spi_freq_hz_show("),
     block("static ssize_t spi_freq_hz_store("),
     block("static ssize_t rotation_show("),

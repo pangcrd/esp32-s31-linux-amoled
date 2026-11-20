@@ -76,6 +76,8 @@ typedef int esp_err_t;
 #define cond_resched() ((void)0)
 #define min(a,b) ((a)<(b)?(a):(b))
 #define dev_info(...) ((void)0)
+/* The protocol-only fixture never arms post-release driver tracing. */
+#define co5300fb_trace_command(...) ((void)0)
 struct spi_device { int unused; };
 struct spi_transfer { const void *tx_buf; u32 len; u8 tx_nbits; bool cs_change; };
 struct co5300fb {

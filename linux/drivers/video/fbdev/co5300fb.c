@@ -50,6 +50,18 @@ struct co5300fb_panel_test_stats {
 	int last_error;
 };
 
+/* Retain the first events after release; later cursor work must not overwrite
+ * the frame/command that explains the login flash. Fits one sysfs page. */
+#define CO5300FB_TRACE_EVENTS 20
+struct co5300fb_trace_event {
+	u64 ms, flush;
+	u32 first, last, damage_first, damage_last, bytes, nonzero, hash, rotation;
+	u16 fb_sample, tx_sample;
+	int ret;
+	u8 type, source, cmd, len, data[4];
+	bool sample_valid;
+};
+
 struct co5300fb {
 	struct spi_device *spi;
 	struct gpio_desc *reset;
@@ -65,9 +77,65 @@ struct co5300fb {
 	struct co5300fb_stats stats; /* Protected by damage_lock. */
 	struct co5300fb_render_stats render_stats; /* Protected by io_lock. */
 	struct co5300fb_panel_test_stats test_stats; /* Protected by io_lock. */
+	bool trace_started; /* Trace fields protected by io_lock after probe. */
+	u32 trace_count;
+	u64 trace_start_ns;
+	struct co5300fb_trace_event trace[CO5300FB_TRACE_EVENTS];
 	u32 palette[16];
 	u8 *command, *pixels;
 };
+
+static struct co5300fb_trace_event *co5300fb_trace_event(struct co5300fb *p,
+						      u8 type, u8 source)
+{
+	struct co5300fb_trace_event *e;
+
+	if (!p->trace_started || p->trace_count == CO5300FB_TRACE_EVENTS)
+		return NULL;
+	e = &p->trace[p->trace_count++];
+	memset(e, 0, sizeof(*e));
+	e->ms = div_u64(ktime_get_ns() - p->trace_start_ns, 1000000);
+	e->type = type;
+	e->source = source;
+	return e;
+}
+
+static void co5300fb_trace_start(struct co5300fb *p)
+{
+	p->trace_count = 0;
+	p->trace_start_ns = ktime_get_ns();
+	p->trace_started = true;
+	co5300fb_trace_event(p, 'H', 0);
+}
+
+static void co5300fb_trace_command(struct co5300fb *p, u8 cmd,
+				  const u8 *data, size_t len, int ret)
+{
+	struct co5300fb_trace_event *e;
+
+	/* Successful address commands belong to the frame entry. Retain errors
+	 * and every other command, especially 28h/10h/51h/53h and re-init. */
+	if (!ret && (cmd == 0x2a || cmd == 0x2b))
+		return;
+	e = co5300fb_trace_event(p, 'C', 0);
+	if (!e)
+		return;
+	e->cmd = cmd;
+	e->len = len;
+	if (len)
+		memcpy(e->data, data, min(len, sizeof(e->data)));
+	e->ret = ret;
+}
+
+static void co5300fb_trace_reset(struct co5300fb *p, u8 level, int ret)
+{
+	struct co5300fb_trace_event *e = co5300fb_trace_event(p, 'X', 0);
+
+	if (e) {
+		e->cmd = level;
+		e->ret = ret;
+	}
+}
 
 static int co5300fb_command(struct co5300fb *p, u8 cmd,
 			    const u8 *data, size_t len)
@@ -88,6 +156,7 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 	{
 		int ret = spi_sync_transfer(p->spi, &t, 1);
 
+		co5300fb_trace_command(p, cmd, data, len, ret);
 		/* Row commands must not feed printk back into fbcon redraws. */
 		if (!p->quiet_commands && cmd != 0x2a && cmd != 0x2b)
 			dev_info(&p->spi->dev,
@@ -196,10 +265,10 @@ static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 /* Diagnostics inspect exactly the rendered bytes passed to SPI. The sample
  * is logical (265,240), the white belly of the positioned 230x240 Tux.
  * Counts/hash describe the pre-SPI CPU buffer, not on-wire measurements. */
-static void co5300fb_measure_render(struct fb_info *info, u32 first, u32 last)
+static void co5300fb_sample_render(struct fb_info *info, u32 first, u32 last,
+				  struct co5300fb_render_stats *s)
 {
 	struct co5300fb *p = info->par;
-	struct co5300fb_render_stats *s = &p->render_stats;
 	u32 rows = last - first + 1, offset = 0, i;
 	const u32 x = 265, y = 240;
 
@@ -241,14 +310,50 @@ static void co5300fb_measure_render(struct fb_info *info, u32 first, u32 last)
 	s->tx_sample = ((u16)p->pixels[offset] << 8) | p->pixels[offset + 1];
 }
 
-/* Caller holds io_lock, including across reset/init for synchronous recovery. */
-static int co5300fb_flush_locked(struct fb_info *info, u32 first, u32 last)
+static void co5300fb_measure_render(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
+
+	co5300fb_sample_render(info, first, last, &p->render_stats);
+}
+
+static struct co5300fb_trace_event *co5300fb_trace_frame(struct fb_info *info,
+						      u32 first, u32 last,
+						      u8 source, bool measured)
+{
+	struct co5300fb *p = info->par;
+	struct co5300fb_render_stats sample = {0};
+	struct co5300fb_trace_event *e = co5300fb_trace_event(p, 'F', source);
+
+	if (!e)
+		return NULL;
+	if (measured)
+		sample = p->render_stats;
+	else
+		co5300fb_sample_render(info, first, last, &sample);
+	e->first = first;
+	e->last = last;
+	e->bytes = sample.bytes;
+	e->nonzero = sample.nonzero_bytes;
+	e->hash = sample.hash;
+	e->rotation = sample.rotation;
+	e->sample_valid = sample.sample_valid;
+	e->fb_sample = sample.fb_sample;
+	e->tx_sample = sample.tx_sample;
+	return e;
+}
+
+/* Caller holds io_lock, including across reset/init for synchronous recovery. */
+static int co5300fb_flush_locked(struct fb_info *info, u32 first, u32 last,
+				  u8 source, u32 damage_first, u32 damage_last)
+{
+	struct co5300fb *p = info->par;
+	struct co5300fb_trace_event *event;
 	u32 cfirst, clast, rfirst, rlast;
 	u32 bytes = p->width * (last - first + 1) * 2;
 	u64 begin, rendered, finish;
 	unsigned long flags;
+	bool measured;
 	int ret;
 
 	begin = ktime_get_ns();
@@ -264,13 +369,25 @@ static int co5300fb_flush_locked(struct fb_info *info, u32 first, u32 last)
 		rlast = p->xoff + p->width - 1;
 	}
 	co5300fb_render(info, first, last);
-	if (READ_ONCE(render_diagnostics))
+	measured = READ_ONCE(render_diagnostics);
+	if (measured)
 		co5300fb_measure_render(info, first, last);
+	/* Snapshot the CPU payload before SPI, independently of the opt-in
+	 * render_stats. Once the bounded capture is full this adds no hashing. */
+	event = co5300fb_trace_frame(info, first, last, source, measured);
+	if (event) {
+		event->damage_first = damage_first;
+		event->damage_last = damage_last;
+	}
 	rendered = ktime_get_ns();
 	ret = co5300fb_write_window(p, cfirst, clast, rfirst, rlast, bytes);
 	finish = ktime_get_ns();
 	spin_lock_irqsave(&p->damage_lock, flags);
 	p->stats.flushes++;
+	if (event) {
+		event->flush = p->stats.flushes;
+		event->ret = ret;
+	}
 	p->stats.errors += !!ret;
 	p->stats.first = first;
 	p->stats.last = last;
@@ -289,7 +406,8 @@ static int co5300fb_flush_locked(struct fb_info *info, u32 first, u32 last)
 	return ret;
 }
 
-static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
+static int co5300fb_flush(struct fb_info *info, u32 first, u32 last,
+			   u32 damage_first, u32 damage_last)
 {
 	struct co5300fb *p = info->par;
 	int ret = 0;
@@ -298,7 +416,7 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 	/* A held direct pattern must survive pending fbcon/cursor work. Writes
 	 * still update screen_buffer; releasing the test requests a full redraw. */
 	if (!p->panel_test_active && !p->update_held)
-		ret = co5300fb_flush_locked(info, first, last);
+		ret = co5300fb_flush_locked(info, first, last, 'D', damage_first, damage_last);
 	mutex_unlock(&p->io_lock);
 	return ret;
 }
@@ -325,15 +443,57 @@ static ssize_t update_hold_store(struct device *dev,
 			goto out;
 		}
 		p->update_held = false;
+		co5300fb_trace_start(p);
 		/* An explicit panel_test continues to own GRAM until released. */
 		if (!p->panel_test_active)
-			ret = co5300fb_flush_locked(info, 0, p->height - 1);
+			ret = co5300fb_flush_locked(info, 0, p->height - 1, 'H', 0, p->height - 1);
 	}
 out:
 	mutex_unlock(&p->io_lock);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(update_hold);
+
+static ssize_t display_trace_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 i;
+	int n;
+
+	mutex_lock(&p->io_lock);
+	n = sysfs_emit(buf,
+		"started=%c events=%u capacity=%u full=%c held=%c test=%c\n"
+		"F origins: H=hold-release D=deferred R=reinit-draw; nz=0 means all-zero payload\n"
+		"belly=fb/tx at (265,240); v=sample-valid; rc=SPI result\n",
+		p->trace_started ? 'Y' : 'N', p->trace_count, CO5300FB_TRACE_EVENTS,
+		p->trace_count == CO5300FB_TRACE_EVENTS ? 'Y' : 'N',
+		p->update_held ? 'Y' : 'N', p->panel_test_active ? 'Y' : 'N');
+	for (i = 0; i < p->trace_count; i++) {
+		const struct co5300fb_trace_event *e = &p->trace[i];
+
+		if (e->type == 'F')
+			n += sysfs_emit_at(buf, n,
+				"%u +%llums F:%c f=%llu rows=%u..%u d=%u..%u n=%u nz=%u hash=%08x rot=%u belly=%04x/%04x v=%c rc=%d\n",
+				i + 1, e->ms, e->source, e->flush, e->first, e->last,
+				e->damage_first, e->damage_last, e->bytes, e->nonzero, e->hash, e->rotation,
+				e->fb_sample, e->tx_sample, e->sample_valid ? 'Y' : 'N', e->ret);
+		else if (e->type == 'C')
+			n += sysfs_emit_at(buf, n,
+				"%u +%llums C cmd=%02x len=%u data=%02x%02x%02x%02x rc=%d\n",
+				i + 1, e->ms, e->cmd, e->len, e->data[0], e->data[1],
+				e->data[2], e->data[3], e->ret);
+		else if (e->type == 'X')
+			n += sysfs_emit_at(buf, n, "%u +%llums X reset-raw=%u rc=%d\n",
+					   i + 1, e->ms, e->cmd, e->ret);
+		else
+			n += sysfs_emit_at(buf, n, "%u +%llums H release\n", i + 1, e->ms);
+	}
+	mutex_unlock(&p->io_lock);
+	return n;
+}
+static DEVICE_ATTR_RO(display_trace);
 
 /* Reading stats must not printk into fbcon and trigger more display work. */
 static ssize_t flush_stats_show(struct device *dev,
@@ -637,6 +797,7 @@ static ssize_t rotation_store(struct device *dev,
 static DEVICE_ATTR_RW(rotation);
 
 static struct attribute *co5300fb_attrs[] = {
+	&dev_attr_display_trace.attr,
 	&dev_attr_update_hold.attr,
 	&dev_attr_flush_stats.attr,
 	&dev_attr_render_stats.attr,
@@ -698,7 +859,7 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 	struct co5300fb *p = info->par;
 	struct fb_deferred_io_pageref *ref;
 	unsigned long flags;
-	u32 first, last;
+	u32 first, last, damage_first, damage_last;
 	int ret;
 
 	spin_lock_irqsave(&p->damage_lock, flags);
@@ -722,6 +883,8 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 	}
 	if (first >= p->height)
 		return;
+	damage_first = first;
+	damage_last = last;
 	/* The failing login trace has successful full clears followed only by
 	 * partial cursor windows. Refresh the complete, shared screen_buffer by
 	 * default so text, raw writes and mmap damage all reach the proven DMA
@@ -734,7 +897,7 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 		first &= ~1U;
 		last = min(last | 1U, p->height - 1);
 	}
-	ret = co5300fb_flush(info, first, last);
+	ret = co5300fb_flush(info, first, last, damage_first, damage_last);
 	if (ret) {
 		dev_err_ratelimited(&p->spi->dev,
 				    "rows %u..%u transfer failed: %d\n", first, last, ret);
@@ -847,10 +1010,12 @@ static int co5300fb_reset_and_init(struct co5300fb *p)
 	int ret;
 
 	ret = gpiod_direction_output_raw(p->reset, 0);
+	co5300fb_trace_reset(p, 0, ret);
 	if (ret)
 		return ret;
 	usleep_range(10000, 11000);
 	gpiod_set_raw_value_cansleep(p->reset, 1);
+	co5300fb_trace_reset(p, 1, 0);
 	if (!p->quiet_commands)
 		dev_info(&p->spi->dev, "reset released, RST raw value=%d (want 1)\n",
 			 gpiod_get_raw_value_cansleep(p->reset));
@@ -888,7 +1053,7 @@ static ssize_t panel_reinit_draw_store(struct device *dev,
 	p->quiet_commands = true;
 	ret = co5300fb_reset_and_init(p);
 	if (!ret)
-		ret = co5300fb_flush_locked(info, 0, p->height - 1);
+		ret = co5300fb_flush_locked(info, 0, p->height - 1, 'R', 0, p->height - 1);
 	p->quiet_commands = quiet_commands;
 out:
 	mutex_unlock(&p->io_lock);
@@ -1049,7 +1214,9 @@ static void co5300fb_remove(struct spi_device *spi)
 	p->stopped = true;
 	spin_unlock_irqrestore(&p->damage_lock, flags);
 	fb_deferred_io_cleanup(info);
+	mutex_lock(&p->io_lock);
 	co5300fb_command(p, 0x28, NULL, 0);
+	mutex_unlock(&p->io_lock);
 	/*
 	 * unregister_framebuffer drops the registration reference and may
 	 * invoke fb_destroy immediately. Do not access info afterwards.
