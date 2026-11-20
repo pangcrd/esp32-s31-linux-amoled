@@ -59,9 +59,19 @@ static int position(const char *s, unsigned int *x, unsigned int *y)
 static int write_at(int fd, const void *buf, size_t size, off_t offset)
 {
 	const unsigned char *p = buf;
+	off_t pos;
+
+	do {
+		pos = lseek(fd, offset, SEEK_SET);
+	} while (pos < 0 && errno == EINTR && !interrupted);
+	if (pos != offset) {
+		if (pos >= 0)
+			errno = EIO;
+		return -1;
+	}
 
 	while (size && !interrupted) {
-		ssize_t n = pwrite(fd, p, size, offset);
+		ssize_t n = write(fd, p, size);
 
 		if (n < 0 && errno == EINTR)
 			continue;
@@ -72,10 +82,48 @@ static int write_at(int fd, const void *buf, size_t size, off_t offset)
 		}
 		p += n;
 		size -= n;
-		offset += n;
 	}
 	if (interrupted) {
 		errno = EINTR;
+		return -1;
+	}
+	return 0;
+}
+
+static int verify_at(int fd, const void *buf, size_t size, off_t offset)
+{
+	unsigned char actual[844]; /* Maximum image width is 422 RGB565 pixels. */
+	size_t done = 0;
+	off_t pos;
+
+	if (size > sizeof(actual)) {
+		errno = EINVAL;
+		return -1;
+	}
+	do {
+		pos = lseek(fd, offset, SEEK_SET);
+	} while (pos < 0 && errno == EINTR && !interrupted);
+	if (pos != offset) {
+		if (pos >= 0)
+			errno = EIO;
+		return -1;
+	}
+	while (done < size && !interrupted) {
+		ssize_t n = read(fd, actual + done, size - done);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			if (!n)
+				errno = EIO;
+			return -1;
+		}
+		done += n;
+	}
+	if (interrupted || memcmp(actual, buf, size)) {
+		errno = interrupted ? EINTR : EIO;
+		fprintf(stderr, "co5300-splash: framebuffer readback failed at byte %lld\n",
+			(long long)offset);
 		return -1;
 	}
 	return 0;
@@ -207,6 +255,17 @@ int main(int argc, char **argv)
 		if (write_at(fb, image + (size_t)row * width * 2, width * 2,
 			     (off_t)(y + row) * fix.line_length + x * 2))
 			goto error;
+	/* A successful syscall alone did not establish visible pixels in the
+	 * board report. Check the actual target rectangle, then drain defio
+	 * through fb_deferred_io_fsync before reporting success to getty. */
+	for (row = 0; row < height; row++)
+		if (verify_at(fb, image + (size_t)row * width * 2, width * 2,
+			      (off_t)(y + row) * fix.line_length + x * 2))
+			goto error;
+	while (fsync(fb) < 0) {
+		if (errno != EINTR || interrupted)
+			goto error;
+	}
 	if (persist) {
 		ret = 0;
 		goto out;
@@ -221,7 +280,8 @@ int main(int argc, char **argv)
 error:
 	perror("co5300-splash");
 out:
-	/* Redraw the current text console before returning, including on error. */
+	/* Only timed mode restores the VT; persistent mode never requests a
+	 * console redraw that could erase its image. */
 	if (graphics && ioctl(tty, KDSETMODE, KD_TEXT) < 0) {
 		perror("co5300-splash: restore text console");
 		ret = 1;

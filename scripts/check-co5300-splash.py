@@ -34,7 +34,8 @@ harness = r'''
 #include <stdarg.h>
 
 static unsigned char frame[4096 * 502];
-static unsigned int w, h, stride, writes, restores, sleeps, scenario;
+static unsigned int w, h, stride, writes, restores, sleeps, scenario, syncs;
+static off_t fbpos;
 static int acquired, persistent;
 static void fail(const char *message) { fprintf(stderr, "FAIL: %s\n", message); exit(2); }
 static int fake_open(const char *path, int flags, ...) {
@@ -82,15 +83,38 @@ static int fake_ioctl(int fd, unsigned long request, ...) {
     va_end(ap);
     return 0;
 }
-static ssize_t fake_pwrite(int fd, const void *buf, size_t size, off_t offset) {
+static off_t fake_lseek(int fd, off_t offset, int whence) {
+    if (fd != 10000) return lseek(fd, offset, whence);
+    if (whence != SEEK_SET || offset < 0 || offset > stride * h) fail("seek bounds");
+    if (scenario == 7) { errno = ESPIPE; return -1; }
+    fbpos = offset;
+    return offset;
+}
+static ssize_t fake_write(int fd, const void *buf, size_t size) {
+    off_t offset = fbpos;
     if (fd != 10000 || (!acquired && !persistent)) fail("drawing without a text/owned VT");
     writes++;
     if (scenario == 4 && writes == 3) { errno = EIO; return -1; }
     if (offset < 0 || (size_t)offset + size > stride * h) fail("framebuffer bounds");
     /* Short writes verify the tool completes each row correctly. */
     if (scenario == 6 && size > 3) size = 3;
-    memcpy(frame + offset, buf, size);
+    if (scenario != 8) memcpy(frame + offset, buf, size);
+    fbpos += size;
     return size;
+}
+static ssize_t fake_read(int fd, void *buf, size_t size) {
+    if (fd != 10000) return read(fd, buf, size);
+    if (fbpos < 0 || (size_t)fbpos + size > stride * h) fail("readback bounds");
+    if (scenario == 6 && size > 5) size = 5;
+    memcpy(buf, frame + fbpos, size);
+    fbpos += size;
+    return size;
+}
+static int fake_fsync(int fd) {
+    if (fd != 10000) fail("sync wrong fd");
+    if (scenario == 9) { errno = EIO; return -1; }
+    syncs++;
+    return 0;
 }
 static int fake_nanosleep(const struct timespec *req, struct timespec *rem) {
     if (persistent) fail("persistent mode must exit without holding");
@@ -103,7 +127,10 @@ static int fake_nanosleep(const struct timespec *req, struct timespec *rem) {
 #define open fake_open
 #define close fake_close
 #define ioctl fake_ioctl
-#define pwrite fake_pwrite
+#define lseek fake_lseek
+#define write fake_write
+#define read fake_read
+#define fsync fake_fsync
 #define nanosleep fake_nanosleep
 #define main splash_main
 '''
@@ -112,7 +139,10 @@ tail = r'''
 #undef open
 #undef close
 #undef ioctl
-#undef pwrite
+#undef lseek
+#undef write
+#undef read
+#undef fsync
 #undef nanosleep
 static void check_image(const char *path, unsigned int iw, unsigned int ih,
                         unsigned int x0, unsigned int y0, int outside) {
@@ -137,13 +167,13 @@ int main(int argc, char **argv) {
     for (unsigned int portrait = 0; portrait < 2; portrait++) {
         w = portrait ? 410 : 502; h = portrait ? 502 : 410;
         stride = w * 2 + 16;
-        for (scenario = 0; scenario <= 6; scenario++) {
+        for (scenario = 0; scenario <= 9; scenario++) {
             memset(frame, 0xa5, sizeof(frame));
-            writes = restores = sleeps = acquired = interrupted = 0;
+            writes = restores = sleeps = syncs = acquired = interrupted = 0;
             char *args[] = { "splash", argv[1], "240", "120", NULL };
             int ret = splash_main(4, args);
             if (scenario == 0 || scenario == 6) {
-                if (ret || restores != 1 || sleeps != 1) fail("success must restore text");
+                if (ret || restores != 1 || sleeps != 1 || syncs != 1) fail("success must sync and restore text");
                 check_image(argv[1], 240, 120, (w - 240) / 2, (h - 120) / 2, 0);
             } else {
                 if (!ret) fail("invalid mode/failure/signal must report failure");
@@ -157,14 +187,14 @@ int main(int argc, char **argv) {
         if (!splash_main(4, bad) || writes || restores) fail("truncated input must not draw");
     }
     w = 502; h = 410; stride = w * 2 + 16; persistent = 1;
-    for (scenario = 0; scenario <= 6; scenario++) {
+    for (scenario = 0; scenario <= 9; scenario++) {
         if (scenario == 5) continue;
         memset(frame, 0xa5, sizeof(frame));
-        writes = restores = sleeps = acquired = interrupted = 0;
+        writes = restores = sleeps = syncs = acquired = interrupted = 0;
         char *args[] = { "splash", "--at", "150,120", "--persist", argv[3], "230", "240", NULL };
         int ret = splash_main(7, args);
         if (scenario == 0 || scenario == 6) {
-            if (ret || restores || sleeps || acquired) fail("persistent mode must leave text mode untouched");
+            if (ret || restores || sleeps || acquired || syncs != 1) fail("persistent mode must sync without a VT switch");
             check_image(argv[3], 230, 240, 150, 120, 0xa5);
             /* SUN12x22 fbcon glyph/cursor updates on banner row 3 and
              * prompt row 4 touch only y=66..109, including backspace and
@@ -193,7 +223,7 @@ int main(int argc, char **argv) {
     char *portrait[] = { "splash", "--at", "150,120", "--persist", argv[3], "230", "240", NULL };
     if (!splash_main(7, portrait) || writes || restores || sleeps) fail("landscape position must reject portrait inset");
     puts("PASS: splash centering/inset, portrait, padded stride, short writes,"
-         " persistent login geometry/preserved pixels/typing/idle, validation and VT restoration");
+         " seek/write/readback/fsync, persistent geometry/preserved pixels/typing/idle and VT restoration");
     return 0;
 }
 '''
