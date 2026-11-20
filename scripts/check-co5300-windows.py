@@ -118,6 +118,14 @@ static unsigned int rotation;
 static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
 static unsigned int refreshes;
 static bool partial_updates;
+static bool render_diagnostics = true;
+static bool resuming;
+static int reset_raw = 1, resume_fail;
+static unsigned resume_calls, sleep_ms;
+static int gpiod_get_raw_value_cansleep(struct gpio_desc *reset) {
+    (void)reset; return reset_raw;
+}
+static void msleep(unsigned ms) { sleep_ms += ms; }
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(2);
@@ -129,6 +137,15 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
                              unsigned int n) {
     (void)dev;
     const u8 *b = t[0].tx_buf;
+    if (resuming) {
+        static const u8 commands[] = { 0x11, 0x53, 0x51, 0x63, 0x29 };
+        unsigned i = resume_calls++;
+        if (n != 1 || i >= 5 || t[0].len != (i == 0 || i == 4 ? 4 : 5) ||
+            b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
+            (i > 0 && i < 4 && b[4] != (i == 1 ? 0x20 : 0xff)))
+            fail("panel resume command order/brightness/single-lane header");
+        return resume_fail == (int)i + 1 ? -EIO : 0;
+    }
     if (t[0].tx_nbits != 1 || t[0].cs_change)
         fail("header lane width / CS boundary");
     calls++;
@@ -248,6 +265,31 @@ static void settings(void) {
         rotation_store(dev, NULL, "180", 3) != -EINVAL ||
         rotation_store(dev, NULL, "90", 2) != 2 || p.rotation != 90 || refreshes != 4)
         fail("portrait flip must preserve dimensions");
+    p.command = calloc(259, 1);
+    if (!p.command) fail("command allocation");
+    resuming = true;
+    unsigned before = refreshes;
+    if (panel_resume_store(dev, NULL, "1", 1) != 1 || resume_calls != 5 ||
+        sleep_ms != 120 || refreshes != before + 1 || p.rotation != 90)
+        fail("explicit panel resume and one redraw");
+    for (resume_fail = 1; resume_fail <= 5; resume_fail++) {
+        resume_calls = sleep_ms = 0; before = refreshes;
+        if (panel_resume_store(dev, NULL, "1", 1) != -EIO ||
+            resume_calls != (unsigned)resume_fail || refreshes != before)
+            fail("resume failures must propagate without a success redraw");
+    }
+    resume_fail = 0; resume_calls = sleep_ms = 0;
+    reset_raw = 0;
+    if (panel_resume_store(dev, NULL, "1", 1) != -EHOSTDOWN || resume_calls)
+        fail("held reset must not send panel commands");
+    reset_raw = -EIO;
+    if (panel_resume_store(dev, NULL, "1", 1) != -EIO || resume_calls)
+        fail("reset read errors must propagate");
+    reset_raw = 1;
+    if (panel_resume_store(dev, NULL, "0", 1) != -EINVAL ||
+        panel_resume_store(dev, NULL, "bad", 3) != -EINVAL || resume_calls)
+        fail("invalid resume request must not send commands");
+    resuming = false; free(p.command);
 }
 static void capture(u32 first, u32 last) {
     calls = phase = retries = 0;
@@ -286,6 +328,14 @@ static void geometry(u32 w, u32 h, u32 rot) {
     co5300fb_deferred_io(&info, &pages);
     if (phase != 3 || p.stats.full_flushes != 1 || p.stats.bytes != w * h * 2)
         fail("default dirty-row update must refresh the full DMA frame");
+    if (p.render_stats.samples != 1 || p.render_stats.bytes != w * h * 2 ||
+        !p.render_stats.nonzero_bytes || p.render_stats.sample_valid != (w > 265 && h > 240))
+        fail("pre-SPI diagnostic range/count/sample validity");
+    if (p.render_stats.sample_valid &&
+        (p.render_stats.fb_sample != pattern(240, 265) ||
+         p.render_stats.tx_sample != pattern(240, 265) ||
+         p.render_stats.sample_offset + 1 >= p.render_stats.bytes))
+        fail("belly diagnostic must match actual rendered RGB565 at every rotation");
     p.stats = (struct co5300fb_stats) {0};
     partial_updates = true;
     run(&info, &pages, 0, h-1);
@@ -341,19 +391,22 @@ int main(void) {
         geometry(512, 512, rot);
     }
     puts("PASS: default full refresh and opt-in partial/mmap windows at all rotations, RGB565 rotation,"
-         " mixed-lane CS, tile edges, failure retry, stats and sysfs validation");
+         " mixed-lane CS, tile edges, retry, render diagnostics and panel resume/error/reset checks");
     return 0;
 }
 """
 program = "\n".join([
-    header, block("struct co5300fb_stats {"), block("struct co5300fb {"), stub,
+    header, block("struct co5300fb_stats {"), block("struct co5300fb_render_stats {"),
+    block("struct co5300fb {"), stub,
     block("static int co5300fb_command("),
     block("static void co5300fb_render("),
+    block("static void co5300fb_measure_render("),
     block("static int co5300fb_flush("),
     block("static ssize_t spi_freq_hz_show("),
     block("static ssize_t spi_freq_hz_store("),
     block("static ssize_t rotation_show("),
     block("static ssize_t rotation_store("),
+    block("static ssize_t panel_resume_store("),
     block("static void co5300fb_deferred_io("), main,
 ])
 with tempfile.TemporaryDirectory(prefix="co5300-windows-") as temp:

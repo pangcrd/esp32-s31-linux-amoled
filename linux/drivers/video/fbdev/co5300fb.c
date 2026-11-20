@@ -22,6 +22,20 @@ static bool partial_updates;
 module_param(partial_updates, bool, 0644);
 MODULE_PARM_DESC(partial_updates, "Enable partial GRAM windows (default: full-frame refresh)");
 
+/* Opt in: hashing a full frame adds CPU work to every diagnostic flush. */
+static bool render_diagnostics;
+module_param(render_diagnostics, bool, 0644);
+MODULE_PARM_DESC(render_diagnostics, "Measure rendered pixels before SPI submission");
+
+struct co5300fb_render_stats {
+	u64 samples;
+	u32 first, last, bytes, nonzero_bytes, hash;
+	u32 rotation;
+	u32 sample_offset;
+	u16 fb_sample, tx_sample;
+	bool sample_valid;
+};
+
 struct co5300fb_stats {
 	u64 flushes, errors, full_flushes;
 	u64 render_us, spi_us, total_us;
@@ -39,6 +53,7 @@ struct co5300fb {
 	u32 first, last, width, height, xoff, yoff;
 	u32 rotation;
 	struct co5300fb_stats stats; /* Protected by damage_lock. */
+	struct co5300fb_render_stats render_stats; /* Protected by io_lock. */
 	u32 palette[16];
 	u8 *command, *pixels;
 };
@@ -133,6 +148,54 @@ static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 	}
 }
 
+/* Diagnostics inspect exactly the rendered bytes passed to SPI. The sample
+ * is logical (265,240), the white belly of the positioned 230x240 Tux.
+ * Counts/hash describe the pre-SPI CPU buffer, not on-wire measurements. */
+static void co5300fb_measure_render(struct fb_info *info, u32 first, u32 last)
+{
+	struct co5300fb *p = info->par;
+	struct co5300fb_render_stats *s = &p->render_stats;
+	u32 rows = last - first + 1, offset = 0, i;
+	const u32 x = 265, y = 240;
+
+	s->samples++;
+	s->first = first;
+	s->last = last;
+	s->bytes = p->width * rows * 2;
+	s->rotation = p->rotation;
+	s->nonzero_bytes = 0;
+	s->hash = 2166136261U;
+	for (i = 0; i < s->bytes; i++) {
+		u8 byte = p->pixels[i];
+
+		s->nonzero_bytes += !!byte;
+		s->hash = (s->hash ^ byte) * 16777619U;
+	}
+	s->sample_valid = x < p->width && y < p->height && y >= first && y <= last;
+	s->sample_offset = 0;
+	s->fb_sample = 0;
+	s->tx_sample = 0;
+	if (!s->sample_valid)
+		return;
+	switch (p->rotation) {
+	case 90:
+		offset = 2 * ((y - first) * p->width + x);
+		break;
+	case 180:
+		offset = 2 * ((p->width - 1 - x) * rows + y - first);
+		break;
+	case 270:
+		offset = 2 * ((last - y) * p->width + p->width - 1 - x);
+		break;
+	default:
+		offset = 2 * (x * rows + last - y);
+		break;
+	}
+	s->sample_offset = offset;
+	s->fb_sample = READ_ONCE(((u16 *)info->screen_buffer)[y * p->width + x]);
+	s->tx_sample = ((u16)p->pixels[offset] << 8) | p->pixels[offset + 1];
+}
+
 static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
@@ -161,6 +224,8 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 		rlast = p->xoff + p->width - 1;
 	}
 	co5300fb_render(info, first, last);
+	if (READ_ONCE(render_diagnostics))
+		co5300fb_measure_render(info, first, last);
 	rendered = ktime_get_ns();
 	address[0] = cfirst >> 8;
 	address[1] = cfirst;
@@ -229,8 +294,76 @@ static ssize_t flush_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(flush_stats);
 
+static ssize_t render_stats_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	struct co5300fb_render_stats s;
+	int reset_raw;
+
+	mutex_lock(&p->io_lock);
+	s = p->render_stats;
+	reset_raw = gpiod_get_raw_value_cansleep(p->reset);
+	mutex_unlock(&p->io_lock);
+	return sysfs_emit(buf,
+		"enabled=%c samples=%llu rows=%u..%u bytes=%u nonzero_bytes=%u hash=%08x\n"
+		"sample_x=265 sample_y=240 sample_valid=%c fb_rgb565=%04x tx_rgb565=%04x tx_offset=%u\n"
+		"width=%u height=%u stride=%u rotation=%u reset_raw=%d\n",
+		READ_ONCE(render_diagnostics) ? 'Y' : 'N', s.samples,
+		s.first, s.last, s.bytes, s.nonzero_bytes, s.hash,
+		s.sample_valid ? 'Y' : 'N', s.fb_sample, s.tx_sample, s.sample_offset,
+		p->width, p->height, info->fix.line_length, s.rotation, reset_raw);
+}
+static DEVICE_ATTR_RO(render_stats);
+
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
 			    unsigned long delay);
+
+/* Explicit recovery experiment only: a black RAMWR does not itself send
+ * sleep/display-off commands. Do not silently reinitialize a healthy panel. */
+static ssize_t panel_resume_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u8 value;
+	u32 request;
+	int ret;
+
+	if (kstrtou32(buf, 10, &request) || request != 1)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	ret = gpiod_get_raw_value_cansleep(p->reset);
+	if (ret <= 0) {
+		ret = ret < 0 ? ret : -EHOSTDOWN;
+		goto out;
+	}
+	ret = co5300fb_command(p, 0x11, NULL, 0);
+	if (ret)
+		goto out;
+	/* Datasheet SLPOUT settling time; keep probe's supplier init unchanged. */
+	msleep(120);
+	value = 0x20;
+	ret = co5300fb_command(p, 0x53, &value, 1);
+	if (ret)
+		goto out;
+	value = 0xff;
+	ret = co5300fb_command(p, 0x51, &value, 1);
+	if (ret)
+		goto out;
+	ret = co5300fb_command(p, 0x63, &value, 1);
+	if (ret)
+		goto out;
+	ret = co5300fb_command(p, 0x29, NULL, 0);
+	if (!ret)
+		co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+out:
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(panel_resume);
 
 static ssize_t spi_freq_hz_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
@@ -295,6 +428,8 @@ static DEVICE_ATTR_RW(rotation);
 
 static struct attribute *co5300fb_attrs[] = {
 	&dev_attr_flush_stats.attr,
+	&dev_attr_render_stats.attr,
+	&dev_attr_panel_resume.attr,
 	&dev_attr_spi_freq_hz.attr,
 	&dev_attr_rotation.attr,
 	NULL,

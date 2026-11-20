@@ -47,3 +47,38 @@ Description:
 		changes between portrait/landscape return EINVAL. The GRAM window
 		alignment and the symmetric 40-pixel content inset are preserved.
 		Resets to the DT setting at probe/reboot. Reading does not flush.
+
+What:		/sys/bus/spi/devices/.../render_stats
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read-only pre-SPI rendering measurements. Also accessible through
+		/sys/class/graphics/fbN/device/render_stats. Enable measurements
+		with /sys/module/co5300fb/parameters/render_diagnostics (default N).
+		Hashing adds CPU work; turn it off after diagnosis. samples counts
+		measured frames. rows and bytes describe the last measured payload;
+		nonzero_bytes counts nonzero payload bytes and hash is FNV-1a-32.
+		The fixed sample (265,240) reports fb_rgb565, tx_rgb565 and its
+		tx_offset in that payload when sample_valid=Y. A full 502x410 frame
+		at rotation 0 puts this pixel at byte 217638. The sample is the
+		white belly of the positioned login Tux (ffff). rotation describes
+		the measured frame. reset_raw is the current physical RST GPIO level
+		(1 releases reset); negative values are GPIO read errors. Samples
+		inspect CPU memory before submission and do not prove on-wire data
+		or panel reception. Reading neither draws nor sends SPI commands.
+
+What:		/sys/bus/spi/devices/.../panel_resume
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only, explicit panel-state diagnostic/recovery. Also accessible
+		through /sys/class/graphics/fbN/device/panel_resume. Writing decimal
+		1 waits for the active window, sends SLPOUT (11h), waits 120 ms,
+		then restores brightness control (53h=20h), normal/HBM brightness
+		(51h=ffh, 63h=ffh) and DISPON (29h). It schedules a full redraw only
+		after every command succeeds. It does not reset GPIO, replace the
+		supplier init sequence or clear framebuffer memory. A physically low
+		RST returns EHOSTDOWN; GPIO/SPI errors propagate. Other writes return
+		EINVAL. It runs only on explicit request; a black frame does not
+		trigger automatic recovery. Success is SPI submission, not proof
+		that the panel accepted the command. Root permission is required.
