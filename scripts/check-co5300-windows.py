@@ -117,6 +117,7 @@ static unsigned int calls, phase, first_want, last_want, width, height;
 static unsigned int rotation;
 static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
 static unsigned int refreshes;
+static bool partial_updates;
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(2);
@@ -279,6 +280,14 @@ static void geometry(u32 w, u32 h, u32 rot) {
     struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
                            .fix = { .line_length = w*2, .smem_len = w*h*2 } };
     struct list_head pages = {0};
+    partial_updates = false;
+    p.dirty = true; p.first = p.last = h / 2;
+    capture(0, h - 1);
+    co5300fb_deferred_io(&info, &pages);
+    if (phase != 3 || p.stats.full_flushes != 1 || p.stats.bytes != w * h * 2)
+        fail("default dirty-row update must refresh the full DMA frame");
+    p.stats = (struct co5300fb_stats) {0};
+    partial_updates = true;
     run(&info, &pages, 0, h-1);
     if (p.stats.full_flushes != 1 || p.stats.bytes != w*h*2 ||
         p.stats.full_total_us != 2 || p.stats.errors)
@@ -331,7 +340,7 @@ int main(void) {
         geometry(2, 2, rot);
         geometry(512, 512, rot);
     }
-    puts("PASS: all four rotations/full/partial/mmap windows, exact RGB565 rotation,"
+    puts("PASS: default full refresh and opt-in partial/mmap windows at all rotations, RGB565 rotation,"
          " mixed-lane CS, tile edges, failure retry, stats and sysfs validation");
     return 0;
 }

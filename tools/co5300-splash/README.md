@@ -13,6 +13,12 @@ It then execs getty even if drawing fails. The image occupies x=150..379,
 y=120..359, inside the 40-pixel safe inset on the 502x410 landscape framebuffer.
 Portrait mode rejects this fixed position safely and still starts getty.
 
+Framebuffer writes use `lseek` + `write`, including short-write handling.
+The tool reads back every target row and calls `fsync` to drain kernel deferred
+I/O before reporting success. A mismatched readback or failed sync reports an
+error and the wrapper continues to getty. This verifies the pixels in memory
+and completion of scheduled work; actual panel visibility needs board testing.
+
 `--persist` validates the image, fbdev format, position and current text VT,
 writes only the image rectangle using the framebuffer stride, and exits. It
 does not clear, sleep, or change/restore the VT mode. SUN12x22 banner/prompt

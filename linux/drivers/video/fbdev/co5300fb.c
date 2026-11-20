@@ -16,6 +16,12 @@
 #include <linux/timekeeping.h>
 #include <linux/vmalloc.h>
 
+/* Full-frame DMA is board-tested. Opt in to partial GRAM windows only when
+ * comparing the login black-screen failure on the actual panel. */
+static bool partial_updates;
+module_param(partial_updates, bool, 0644);
+MODULE_PARM_DESC(partial_updates, "Enable partial GRAM windows (default: full-frame refresh)");
+
 struct co5300fb_stats {
 	u64 flushes, errors, full_flushes;
 	u64 render_us, spi_us, total_us;
@@ -365,9 +371,18 @@ static void co5300fb_deferred_io(struct fb_info *info, struct list_head *pages)
 	}
 	if (first >= p->height)
 		return;
-	/* Include the unchanged neighbour to keep CASET start/extent even. */
-	first &= ~1U;
-	last = min(last | 1U, p->height - 1);
+	/* The failing login trace has successful full clears followed only by
+	 * partial cursor windows. Refresh the complete, shared screen_buffer by
+	 * default so text, raw writes and mmap damage all reach the proven DMA
+	 * window. Keep partial windows available for on-board A/B diagnosis. */
+	if (!READ_ONCE(partial_updates)) {
+		first = 0;
+		last = p->height - 1;
+	} else {
+		/* Include the unchanged neighbour to keep start/extent even. */
+		first &= ~1U;
+		last = min(last | 1U, p->height - 1);
+	}
 	ret = co5300fb_flush(info, first, last);
 	if (ret) {
 		dev_err_ratelimited(&p->spi->dev,
