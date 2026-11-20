@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Convert an 8-bit binary PPM (P6) to LE RGB565, or create the sample logo."""
+"""Convert 8-bit PPM (P3/P6) to LE RGB565, optionally resized, or create a sample."""
 import argparse
 from pathlib import Path
 import re
@@ -26,16 +26,39 @@ def ppm(data):
             raise ValueError("Incomplete PPM header")
         tokens.append(match[0])
         pos += len(match[0])
-    if tokens[0] != b"P6" or tokens[3] != b"255":
-        raise ValueError("Expected binary PPM P6 with maxval 255")
+    if tokens[0] not in (b"P3", b"P6") or tokens[3] != b"255":
+        raise ValueError("Expected PPM P3/P6 with maxval 255")
     width, height = int(tokens[1]), int(tokens[2])
+    if width <= 0 or height <= 0:
+        raise ValueError("PPM dimensions must be positive")
     if not data[pos:pos + 1].isspace():
         raise ValueError("Missing PPM raster separator")
     pos += 2 if data[pos:pos + 2] == b"\r\n" else 1
     pixels = data[pos:]
+    if tokens[0] == b"P3":
+        values = [int(value) for value in re.sub(rb"#[^\r\n]*", b"", pixels).split()]
+        if any(value < 0 or value > 255 for value in values):
+            raise ValueError("PPM channels must be within 0..255")
+        pixels = bytes(values)
     if len(pixels) != width * height * 3:
         raise ValueError("PPM raster size does not match its dimensions")
     return width, height, pixels
+
+
+def resize(width, height, pixels, size):
+    match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)", size)
+    if not match:
+        raise ValueError("Size must be WIDTHxHEIGHT")
+    new_width, new_height = map(int, match.groups())
+    if new_width > 422 or new_height > 422:
+        raise ValueError("Requested size exceeds the panel's safe area")
+    out = bytearray()
+    # Nearest neighbour keeps the kernel logo's original palette and black.
+    for y in range(new_height):
+        for x in range(new_width):
+            offset = ((y * height // new_height) * width + x * width // new_width) * 3
+            out += pixels[offset:offset + 3]
+    return new_width, new_height, out
 
 
 def sample():
@@ -82,10 +105,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", type=Path)
     parser.add_argument("--sample", action="store_true")
+    parser.add_argument("--size", help="Resize to WIDTHxHEIGHT (nearest neighbour)")
     args = parser.parse_args()
     if len(args.paths) != (1 if args.sample else 2):
         parser.error("Use --sample OUTPUT, or INPUT.ppm OUTPUT.rgb565")
     width, height, pixels = sample() if args.sample else ppm(args.paths[0].read_bytes())
+    if args.size:
+        width, height, pixels = resize(width, height, pixels, args.size)
     if not (0 < width <= 422 and 0 < height <= 330 or
             0 < width <= 330 and 0 < height <= 422):
         raise ValueError("Logo must fit within 422x330 landscape or 330x422 portrait")

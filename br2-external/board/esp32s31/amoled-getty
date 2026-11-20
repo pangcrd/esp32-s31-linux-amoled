@@ -5,4 +5,9 @@ printf '\033[0m\033[2J\033[H\033[3J' > /dev/tty0
 # Push the login banner down 3 lines so it clears the panel's rounded
 # top corners (40 px safe inset); the console itself stays full-screen.
 printf '\n\n\n' > /dev/tty0
+# Draw below the banner/prompt before getty, without a VT switch or clear.
+# The 230x240 image at (150,120) stays inside the 40 px safe inset.
+/usr/bin/co5300-splash --at 150,120 --persist \
+	/usr/share/co5300-splash/tux.rgb565 230 240 ||
+	printf '%s\n' 'amoled-getty: penguin unavailable; continuing login' >&2
 exec /sbin/getty -L tty0 115200 vt100

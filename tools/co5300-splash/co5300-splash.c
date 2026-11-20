@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-/* One-shot, centered little-endian RGB565 splash for the CO5300 only. */
+/* Little-endian RGB565 splash or persistent login image for the CO5300. */
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fb.h>
@@ -37,6 +37,25 @@ static unsigned int number(const char *s, unsigned int limit)
 	return n;
 }
 
+static int position(const char *s, unsigned int *x, unsigned int *y)
+{
+	char *end;
+	unsigned long a, b;
+	const char *second;
+
+	errno = 0;
+	a = strtoul(s, &end, 10);
+	if (errno || end == s || *end != ',' || a > 512)
+		return -1;
+	second = end + 1;
+	b = strtoul(second, &end, 10);
+	if (errno || end == second || *end || b > 512)
+		return -1;
+	*x = a;
+	*y = b;
+	return 0;
+}
+
 static int write_at(int fd, const void *buf, size_t size, off_t offset)
 {
 	const unsigned char *p = buf;
@@ -68,21 +87,33 @@ int main(int argc, char **argv)
 	struct fb_var_screeninfo var;
 	struct stat st;
 	struct sigaction sa = { .sa_handler = stop };
-	unsigned int width, height, seconds, x, y, row;
+	unsigned int width, height, seconds, x = 0, y = 0, row;
 	unsigned char *image = NULL, *black = NULL;
 	size_t size, done = 0;
 	int input = -1, fb = -1, tty = -1, mode, graphics = 0, ret = 1;
+	int persist = 0, positioned = 0, first = 1;
 	struct timespec hold;
 
-	if (argc < 4 || argc > 5) {
-		fprintf(stderr, "Usage: %s IMAGE.rgb565 WIDTH HEIGHT [SECONDS (1..10)]\n", argv[0]);
-		return 1;
+	while (first < argc && argv[first][0] == '-') {
+		if (!strcmp(argv[first], "--persist") && !persist) {
+			persist = 1;
+			first++;
+		} else if (!strcmp(argv[first], "--at") && !positioned && first + 1 < argc) {
+			if (position(argv[first + 1], &x, &y))
+				goto usage;
+			positioned = 1;
+			first += 2;
+		} else {
+			goto usage;
+		}
 	}
-	width = number(argv[2], 422);
-	height = number(argv[3], 422);
-	seconds = argc == 5 ? number(argv[4], 10) : 2;
+	if (argc - first != 3 && (persist || argc - first != 4))
+		goto usage;
+	width = number(argv[first + 1], 422);
+	height = number(argv[first + 2], 422);
+	seconds = argc - first == 4 ? number(argv[first + 3], 10) : 2;
 	size = (size_t)width * height * 2;
-	input = open(argv[1], O_RDONLY | O_CLOEXEC);
+	input = open(argv[first], O_RDONLY | O_CLOEXEC);
 	if (input < 0 || fstat(input, &st) < 0)
 		goto error;
 	if (st.st_size != (off_t)size) {
@@ -125,9 +156,20 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Expected CO5300 RGB565; image must fit the 40 px inset\n");
 		goto out;
 	}
-	black = calloc(1, fix.line_length);
-	if (!black)
-		goto error;
+	if (!positioned) {
+		x = (var.xres - width) / 2;
+		y = (var.yres - height) / 2;
+	}
+	if (x < INSET || y < INSET ||
+	    x > var.xres - INSET - width || y > var.yres - INSET - height) {
+		fprintf(stderr, "Image position must stay inside the 40 px inset\n");
+		goto out;
+	}
+	if (!persist) {
+		black = calloc(1, fix.line_length);
+		if (!black)
+			goto error;
+	}
 	/* The file format is LE; fbdev pixels are native-endian. */
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 	for (done = 0; done < size; done += 2) {
@@ -148,19 +190,27 @@ int main(int argc, char **argv)
 	if (sigaction(SIGINT, &sa, NULL) || sigaction(SIGTERM, &sa, NULL) ||
 	    sigaction(SIGHUP, &sa, NULL))
 		goto error;
-	if (interrupted || ioctl(tty, KDSETMODE, KD_GRAPHICS) < 0)
-		goto error;
-	graphics = 1;
-	/* fbcon keeps collecting text while graphics mode suppresses redraws. */
-	for (row = 0; row < var.yres; row++)
-		if (write_at(fb, black, fix.line_length, (off_t)row * fix.line_length))
+	if (!persist) {
+		if (interrupted || ioctl(tty, KDSETMODE, KD_GRAPHICS) < 0)
 			goto error;
-	x = (var.xres - width) / 2;
-	y = (var.yres - height) / 2;
+		graphics = 1;
+		/* fbcon collects text while graphics mode suppresses redraws. */
+		for (row = 0; row < var.yres; row++)
+			if (write_at(fb, black, fix.line_length, (off_t)row * fix.line_length))
+				goto error;
+	}
+	/* Persistent mode touches only the image rectangle, then exits in
+	 * KD_TEXT. Getty's SUN12x22 text/cursor on rows 3/4 is above y=120;
+	 * its partial updates leave these pixels intact. A full VT redraw or
+	 * scrolling can replace them; the wrapper redraws on each respawn. */
 	for (row = 0; row < height; row++)
 		if (write_at(fb, image + (size_t)row * width * 2, width * 2,
 			     (off_t)(y + row) * fix.line_length + x * 2))
 			goto error;
+	if (persist) {
+		ret = 0;
+		goto out;
+	}
 	hold = (struct timespec) { .tv_sec = seconds };
 	while (!interrupted && nanosleep(&hold, &hold) < 0) {
 		if (errno != EINTR)
@@ -185,4 +235,10 @@ out:
 	free(black);
 	free(image);
 	return ret;
+usage:
+	fprintf(stderr,
+		"Usage: %s [--at X,Y] [--persist] IMAGE.rgb565 WIDTH HEIGHT [SECONDS (1..10)]\n"
+		"  --persist: draw only the image and exit in text mode; omit SECONDS.\n",
+		argv[0]);
+	return 1;
 }
