@@ -202,3 +202,44 @@ Description:
 		EINVAL without changing state. Successful release transfers count
 		in normal flush_stats/render_stats; held skips do not. Root permission
 		is required. The wrapper releases on splash failure or interruption.
+
+What:		/sys/bus/spi/devices/.../display_trace
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read-only, bounded history of display activity after update_hold
+		release. Also accessible through /sys/class/graphics/fbN/device/
+		display_trace. Inactive at probe. Releasing an active update_hold arms
+		a fresh capture, including the synchronous release frame. The login
+		wrapper does this automatically. The first 20 events are retained;
+		capture then freezes so later cursor work cannot overwrite evidence.
+		Reading neither rearms, draws, logs nor sends commands. To rearm use
+		the existing update_hold=1 then update_hold=0 controls.
+
+		Header fields show started/events/capacity/full and current held/test
+		state. Event lines have a sequence number and milliseconds since arm.
+		F:H is a hold-release frame, F:D deferred I/O, F:R panel_reinit_draw.
+		f is the global attempted-flush count; rows is the rendered logical
+		row range; d is the original dirty-row union before full-refresh or
+		even-row expansion. Release/reinit requests have full-frame d ranges.
+		n is requested payload bytes, nz counts nonzero payload bytes, hash
+		is FNV-1a-32, rot is software rotation, belly is framebuffer/transmit
+		RGB565 at logical (265,240), and v says whether this sample is valid.
+		nz=0 identifies an all-zero payload; nonzero hash alone does not.
+		rc is the window SPI result: failures may precede actual RAMWR.
+
+		C records non-window DCS commands with command byte, parameter length,
+		first four parameter bytes (zero padded), and return code. Successful
+		CASET/RASET belong to F entries; failed address commands are recorded.
+		X records physical reset requests with raw level and assertion result;
+		release uses the GPIO API without a return code. H marks capture start
+		at hold release. Direct panel_test windows are not F entries; their
+		existing panel_test_stats remain separate. Init/resume/TE commands
+		are captured when they occur after arming.
+
+		Measurements inspect the exact CPU payload before SPI under io_lock,
+		and do not establish physical panel reception. Snapshot hashing adds
+		bounded CPU work until capture fills. It is independent of the opt-in
+		render_diagnostics flag and does not increment render_stats when that
+		flag is disabled. Existing geometry, commands and transfer behavior
+		are unchanged. Root access to update_hold is needed to rearm manually.
