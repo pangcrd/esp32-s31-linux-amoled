@@ -390,7 +390,9 @@ int main(void){
         t.len=len;t.tx_sg=(struct sg_table){pages,nents};
         memset(spi_regs,0,sizeof(spi_regs));spi_regs[S31_SPI_USER/4]=S31_SPI_FWRITE_QUAD;
         if(!esp32s31_spi_can_dma(&ctlr,&dev,&t))fail("aligned TX-SG was rejected");
-        if(esp32s31_spi_dma_tx_sg(&s,&ctlr,&t,0))fail("TX-SG returned error");
+        u32 misc=left>len?S31_SPI_CS_KEEP_ACTIVE:0;
+        if(esp32s31_spi_dma_tx_sg(&s,&ctlr,&t,misc))fail("TX-SG returned error");
+        if(spi_regs[S31_SPI_MISC/4]!=misc)fail("DMA lost internal CS retention flags");
         inspect(submitted_desc,pages,nents,true);
         s31_axi_free_desc(&submitted_desc->vd);submitted_desc=NULL;
         total+=len;left-=len;transfers++;

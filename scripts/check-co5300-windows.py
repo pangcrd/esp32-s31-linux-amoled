@@ -20,7 +20,7 @@ dts = (args.source.resolve().parents[3] /
        "arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts").read_text()
 board_init = bytes.fromhex(re.search(r"chipone,init-sequence\s*=\s*\[([^]]+)\]", dts)[1])
 assert board_init == bytes.fromhex(
-    "fe 01 00 00 00 c4 01 00 00 80 3a 01 00 00 55 34 00 00 00 "
+    "36 01 00 00 00 fe 01 00 00 00 c4 01 00 00 80 3a 01 00 00 55 34 00 00 00 "
     "53 01 00 00 20 51 01 00 00 ff 63 01 00 00 ff 11 00 02 58"), \
     "Board DT must retain supplier order/delays and use parameterless TE-off"
 
@@ -196,14 +196,14 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
     if (!locked_mutex) fail("SPI submission must remain under io_lock");
     const u8 *b = t[0].tx_buf;
     if (reinitializing) {
-        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
-        static const u8 values[] = { 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
+        static const u8 commands[] = { 0x36, 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
+        static const u8 values[] = { 0, 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
         unsigned i = init_calls++;
-        if (n != 1 || i >= ARRAY_SIZE(commands) || t[0].len != (i < 7 && i != 3 ? 5 : 4) ||
+        if (n != 1 || i >= ARRAY_SIZE(commands) || t[0].len != (i < 8 && i != 4 ? 5 : 4) ||
             b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
-            (i < 7 && i != 3 && b[4] != values[i]))
+            (i < 8 && i != 4 && b[4] != values[i]))
             fail("full supplier reinit sequence and RGB565/TE parameters");
-        if (i == 8) reinitializing = false;
+        if (i == 9) reinitializing = false;
         return init_fail == i + 1 ? -EIO : 0;
     }
     if (te_off) {
@@ -452,10 +452,10 @@ static void direct_panel(u32 rot) {
     te_off = false; test_fail = 0;
     reinitializing = true; init_calls = init_fail = reset_calls = reset_us = sleep_ms = 0;
     before = refreshes;
-    if (panel_reinit_store(dev, NULL, "1", 1) != 1 || init_calls != 9 || reset_calls != 1 ||
+    if (panel_reinit_store(dev, NULL, "1", 1) != 1 || init_calls != 10 || reset_calls != 1 ||
         reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 || p.quiet_commands ||
         refreshes != before + 1) fail("full manual reset + supplier delay/order + redraw");
-    for (init_fail = 1; init_fail <= 9; init_fail++) {
+    for (init_fail = 1; init_fail <= 10; init_fail++) {
         reinitializing = true; init_calls = 0;
         p.panel_test_active = true; p.panel_test_mode = 1;
         if (panel_reinit_store(dev, NULL, "1", 1) != -EIO ||
@@ -572,7 +572,7 @@ static void synchronous_recovery(struct fb_info *info) {
         u64 flushes = p->stats.flushes, samples = p->render_stats.samples;
         /* Recovery is always full-frame even with partial updates enabled. */
         partial_updates = true;
-        if (draw_attempt(info, "1\n") != 2 || init_calls != 9 || reset_calls != 1 ||
+        if (draw_attempt(info, "1\n") != 2 || init_calls != 10 || reset_calls != 1 ||
             reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 ||
             calls != 3 || phase != 3 || p->panel_test_active || p->panel_test_mode ||
             p->stats.flushes != flushes + 1 || p->stats.full_flushes != flushes + 1 ||
@@ -609,7 +609,7 @@ static void synchronous_recovery(struct fb_info *info) {
     if (draw_attempt(info, "1") != -EINVAL || init_calls || calls)
         fail("draw must reject a malformed supplier sequence before sending commands");
     custom_init = false;
-    for (init_fail = 1; init_fail <= 9; init_fail++) {
+    for (init_fail = 1; init_fail <= 10; init_fail++) {
         p->panel_test_active = true; p->panel_test_mode = 1;
         if (draw_attempt(info, "1") != -EIO || init_calls != init_fail || calls ||
             p->panel_test_active || p->panel_test_mode)
@@ -619,7 +619,7 @@ static void synchronous_recovery(struct fb_info *info) {
     if (p->stats.flushes != flushes || p->render_stats.samples != samples)
         fail("reset/init failure must not count a framebuffer flush/render");
     for (injected = 1; injected <= 3; injected++) {
-        if (draw_attempt(info, "1") != -EIO || init_calls != 9 || calls != injected ||
+        if (draw_attempt(info, "1") != -EIO || init_calls != 10 || calls != injected ||
             p->stats.flushes != flushes + injected || p->stats.errors != injected ||
             p->stats.full_flushes != flushes)
             fail("draw CASET/RASET/RAMWR failures must propagate and update normal stats");
