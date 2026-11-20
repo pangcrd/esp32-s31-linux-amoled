@@ -240,7 +240,8 @@ static void co5300fb_measure_render(struct fb_info *info, u32 first, u32 last)
 	s->tx_sample = ((u16)p->pixels[offset] << 8) | p->pixels[offset + 1];
 }
 
-static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
+/* Caller holds io_lock, including across reset/init for synchronous recovery. */
+static int co5300fb_flush_locked(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
 	u32 cfirst, clast, rfirst, rlast;
@@ -249,13 +250,6 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 	unsigned long flags;
 	int ret;
 
-	mutex_lock(&p->io_lock);
-	/* A held direct pattern must survive pending fbcon/cursor work. Writes
-	 * still update screen_buffer; releasing the test requests a full redraw. */
-	if (p->panel_test_active) {
-		mutex_unlock(&p->io_lock);
-		return 0;
-	}
 	begin = ktime_get_ns();
 	if (p->rotation == 90 || p->rotation == 270) {
 		cfirst = p->yoff;
@@ -291,6 +285,19 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 		p->stats.max_full_us = max(p->stats.max_full_us, p->stats.total_us);
 	}
 	spin_unlock_irqrestore(&p->damage_lock, flags);
+	return ret;
+}
+
+static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
+{
+	struct co5300fb *p = info->par;
+	int ret = 0;
+
+	mutex_lock(&p->io_lock);
+	/* A held direct pattern must survive pending fbcon/cursor work. Writes
+	 * still update screen_buffer; releasing the test requests a full redraw. */
+	if (!p->panel_test_active)
+		ret = co5300fb_flush_locked(info, first, last);
 	mutex_unlock(&p->io_lock);
 	return ret;
 }
@@ -485,6 +492,11 @@ static ssize_t panel_reinit_store(struct device *dev,
 				 const char *buf, size_t count);
 static DEVICE_ATTR_WO(panel_reinit);
 
+static ssize_t panel_reinit_draw_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count);
+static DEVICE_ATTR_WO(panel_reinit_draw);
+
 /* Explicit recovery experiment only: a black RAMWR does not itself send
  * sleep/display-off commands. Do not silently reinitialize a healthy panel. */
 static ssize_t panel_resume_store(struct device *dev,
@@ -599,6 +611,7 @@ static struct attribute *co5300fb_attrs[] = {
 	&dev_attr_panel_test_stats.attr,
 	&dev_attr_panel_te_off.attr,
 	&dev_attr_panel_reinit.attr,
+	&dev_attr_panel_reinit_draw.attr,
 	&dev_attr_spi_freq_hz.attr,
 	&dev_attr_rotation.attr,
 	NULL,
@@ -746,13 +759,14 @@ static const struct fb_ops co5300fb_ops = {
 static int co5300fb_init_sequence(struct co5300fb *p)
 {
 	static const u8 defaults[] = {
-		/* Keep the proven supplier sequence; rotation is software only.
-		 * Display On (0x29) follows this table.
+		/* Supplier order with TE disabled from initialization: 34h has
+		 * no parameter; 35h=00h would enable vertical-blank TE output.
+		 * Rotation is software only. Display On (0x29) follows this table.
 		 */
 		0xfe, 1, 0, 0, 0x00,
 		0xc4, 1, 0, 0, 0x80,
 		0x3a, 1, 0, 0, 0x55,
-		0x35, 1, 0, 0, 0x00,
+		0x34, 0, 0, 0,
 		0x53, 1, 0, 0, 0x20,
 		0x51, 1, 0, 0, 0xff,
 		0x63, 1, 0, 0, 0xff,
@@ -809,6 +823,40 @@ static int co5300fb_reset_and_init(struct co5300fb *p)
 	if (ret)
 		return ret;
 	return co5300fb_command(p, 0x29, NULL, 0);
+}
+
+static ssize_t panel_reinit_draw_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	bool quiet_commands;
+	u32 request;
+	int ret;
+
+	if (kstrtou32(buf, 10, &request) || request != 1)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	/* The renderer uses preallocated buffers and cannot otherwise fail. */
+	if (!info->screen_buffer || !p->pixels || !p->command) {
+		ret = -ENODEV;
+		goto out;
+	}
+	/* Replace any held direct pattern with the current framebuffer. Keep
+	 * printk out of fbcon and retain the lock until full RAMWR completes.
+	 * Do not defer the draw or enqueue a replacement on failure. */
+	p->panel_test_active = false;
+	p->panel_test_mode = 0;
+	quiet_commands = p->quiet_commands;
+	p->quiet_commands = true;
+	ret = co5300fb_reset_and_init(p);
+	if (!ret)
+		ret = co5300fb_flush_locked(info, 0, p->height - 1);
+	p->quiet_commands = quiet_commands;
+out:
+	mutex_unlock(&p->io_lock);
+	return ret ? ret : count;
 }
 
 static ssize_t panel_reinit_store(struct device *dev,
@@ -933,8 +981,8 @@ static int co5300fb_probe(struct spi_device *spi)
 	 * GPIO is flagged ACTIVE LOW. Raw 0 = physical 0 V = reset
 	 * asserted; raw 1 = physical 3.3 V = reset released. The
 	 * readback below proves the release in dmesg. */
-	/* Init sequence (supplier order, incl. 0x3a=0x55 and the 0x35
-	 * data byte) then Display On. */
+	/* Init sequence (supplier order, RGB565 3ah=55h, parameterless
+	 * TE-off 34h on this board), then Display On. */
 	ret = co5300fb_reset_and_init(p);
 	if (ret)
 		goto cleanup;
