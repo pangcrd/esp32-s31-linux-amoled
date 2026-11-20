@@ -255,8 +255,17 @@ int main(int argc, char **argv) {
     char bitmap[44]; memset(bitmap, 255, sizeof(bitmap));
     struct fb_image glyph = { .dx = 48, .dy = 66, .width = 12, .height = 22,
                              .depth = 1, .fg_color = 7, .data = bitmap };
+    p.panel_test_active = true;
     info.fbops->fb_imageblit(&info, &glyph); dirty(&info, 66, 87);
     if (((u16 *)info.screen_buffer)[66 * 502 + 48] != 0xffff) fail("actual SUN12x22-format sys_imageblit must write glyph pixels");
+    u64 held_flushes = p.stats.flushes, held_samples = p.render_stats.samples;
+    phase = 0; info.deferred_work.pending = false;
+    co5300fb_deferred_io(&info, &pages);
+    if (phase || p.stats.flushes != held_flushes || p.render_stats.samples != held_samples)
+        fail("held pattern must suppress SPI while canonical fbcon writes continue");
+    p.panel_test_active = false;
+    co5300fb_damage(&info, 0, 409, p.defio.delay);
+    dirty(&info, 0, 409);
     drain(&info, &pages);
     struct fb_copyarea copy = { .sx = 48, .sy = 66, .dx = 48, .dy = 88, .width = 12, .height = 22 };
     info.fbops->fb_copyarea(&info, &copy); dirty(&info, 88, 109); drain(&info, &pages);
@@ -272,7 +281,7 @@ int main(int argc, char **argv) {
     pages.first = &page; drain(&info, &pages);
     free(white); free(readback); free(tux); co5300fb_destroy(&info);
     puts("PASS: actual Linux sysmem/deferred macros, 8-byte/full-frame/Tux writes and readback,"
-         " glyph/fill/copy damage, mmap pages, pre-SPI belly diagnostics and full-frame RGB565 SPI");
+         " glyph/fill/copy damage, held-pattern canonical restoration, mmap pages and full-frame RGB565 SPI");
     return 0;
 }
 '''
@@ -291,8 +300,9 @@ for file, name in (("sysimgblt.c", "sys_imageblit"), ("sysfillrect.c", "sys_fill
                    ("syscopyarea.c", "sys_copyarea")):
     program.append(block((core / file).read_text(), name))
 program += [macros, block(driver, "struct co5300fb_stats {"),
-            block(driver, "struct co5300fb_render_stats {"), block(driver, "struct co5300fb {")]
-for name in ("co5300fb_command", "co5300fb_render", "co5300fb_measure_render", "co5300fb_flush", "co5300fb_damage",
+            block(driver, "struct co5300fb_render_stats {"),
+            block(driver, "struct co5300fb_panel_test_stats {"), block(driver, "struct co5300fb {")]
+for name in ("co5300fb_command", "co5300fb_write_window", "co5300fb_render", "co5300fb_measure_render", "co5300fb_flush", "co5300fb_damage",
              "co5300fb_damage_range", "co5300fb_damage_area"):
     program.append(block(driver, name))
 start = driver.index("FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(")

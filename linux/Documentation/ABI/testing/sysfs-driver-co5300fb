@@ -82,3 +82,64 @@ Description:
 		EINVAL. It runs only on explicit request; a black frame does not
 		trigger automatic recovery. Success is SPI submission, not proof
 		that the panel accepted the command. Root permission is required.
+
+What:		/sys/bus/spi/devices/.../panel_test
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only direct panel test, also accessible through
+		/sys/class/graphics/fbN/device/panel_test. Decimal 1 fills the full
+		GRAM window with red RGB565 f800; 2 writes full black followed by a
+		centered green RGB565 07e0 rectangle. On the standard landscape
+		board, full CASET/RASET are 22..431/0..501 (411640 payload bytes).
+		The green rectangle uses 124..327/126..375 (102000 payload bytes).
+		All starts and extents are even. Native window dimensions follow
+		the configured geometry/rotation. No framebuffer memory is read or
+		modified and the renderer is bypassed; the same command/RAMWR and
+		SPI/GDMA paths are used as normal flushes.
+
+		The pattern is held: normal fbcon/deferred flushes send no SPI while
+		active, so cursor work cannot erase it. Console input and framebuffer
+		memory updates continue. Write 0 to release and request a full redraw
+		of the current framebuffer. SPI failures release the hold, request a
+		redraw and propagate the error. Invalid requests return EINVAL. The
+		test is inactive by default and is never triggered automatically.
+
+What:		/sys/bus/spi/devices/.../panel_test_stats
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read-only direct-test state/counters. active/mode describe the hold;
+		last_mode/runs/errors/last_error describe direct test attempts.
+		windows/bytes count successful RAMWR submissions in the last test
+		run; columns/rows/color describe its last attempted window. Standard
+		mode 1 succeeds with windows=1 bytes=411640; mode 2 succeeds with
+		windows=2 bytes=513640. Reinitialization replay counts as another run.
+		These counts do not prove physical panel reception. Normal flush_stats
+		and render_stats do not count direct tests. Reading sends no commands.
+
+What:		/sys/bus/spi/devices/.../panel_te_off
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only explicit TE-off experiment. Decimal 1 sends DCS 34h with
+		no parameter and schedules a redraw. DCS 35h with parameter 00h is
+		TE-on with vertical-blank output, not TE-off. This control does not
+		change the supplier's probe sequence or release an active panel_test.
+		SPI errors propagate; other values return EINVAL. No automatic use.
+
+What:		/sys/bus/spi/devices/.../panel_reinit
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only manual full reinitialization. Decimal 1 waits for the
+		current window, pulses physical reset low for 10..11 ms, releases
+		reset, waits 150 ms, replays the same validated supplier init used at
+		probe (including its delays), then sends DISPON. With the standard
+		sequence this restores FE/C4/3A/35/53/51/63/11/29 and takes about
+		760 ms plus transport. The probe path and defaults are unchanged.
+		An active direct pattern is replayed after success; otherwise a full
+		framebuffer redraw is queued. Failure releases the test hold and
+		queues a framebuffer redraw. GPIO/SPI/sequence errors propagate;
+		other values return EINVAL. Recovery logs are kept out of fbcon so
+		they do not overwrite login memory. Runs only on explicit request.
