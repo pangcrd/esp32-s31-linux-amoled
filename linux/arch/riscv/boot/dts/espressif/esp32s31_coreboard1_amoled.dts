@@ -2,7 +2,7 @@
 /* C05300AF-51: native 410x502, landscape framebuffer 502x410.
  * Software rotation maps logical X to GRAM rows 0..501 and logical Y
  * (reversed) to GRAM columns 22..431. MADCTL cannot exchange axes.
- * Keep the supplier sequence and the working 40 MHz from the test log.
+ * Keep supplier order and the working 40 MHz; disable TE during init.
  */
 #include "esp32s31_coreboard1.dts"
 #include <dt-bindings/dma/espressif,esp32s31-axi-gdma.h>
@@ -28,10 +28,12 @@
 		chipone,height = <410>;
 		chipone,x-offset = <0>;
 		chipone,y-offset = <22>;
-		/* Record format: [cmd, len, delay-ms BE16, data...] */
+		/* Record format: [cmd, len, delay-ms BE16, data...].
+		 * TE-off is parameterless 34h; 35h=00h enables TE output.
+		 */
 		chipone,init-sequence = [fe 01 00 00 00 c4 01 00 00 80
 					  3a 01 00 00 55
-					  35 01 00 00 00 53 01 00 00 20
+					  34 00 00 00 53 01 00 00 20
 					  51 01 00 00 ff 63 01 00 00 ff
 					  11 00 02 58];
 	};

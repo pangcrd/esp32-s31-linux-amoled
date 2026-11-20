@@ -5,9 +5,10 @@ Description:
 		Read-only CO5300 framebuffer flush statistics. Output consists of
 		newline-separated key=value fields in four lines.
 
-		flushes counts attempted dirty-range flushes; errors counts failed
-		flushes. rows gives the last logical first..last row range and bytes
-		is the requested pixel payload, including unchanged alignment rows.
+		flushes counts attempted dirty-range and panel_reinit_draw flushes;
+		errors counts failed flushes. rows gives the last logical first..last
+		row range and bytes is the requested pixel payload, including
+		unchanged alignment rows.
 
 		render_us is tiled software rotation time; spi_us includes CASET,
 		RASET and the synchronous single-header/quad-pixel message, including
@@ -124,8 +125,9 @@ Contact:	ESP32-S31 Linux maintainers
 Description:
 		Write-only explicit TE-off experiment. Decimal 1 sends DCS 34h with
 		no parameter and schedules a redraw. DCS 35h with parameter 00h is
-		TE-on with vertical-blank output, not TE-off. This control does not
-		change the supplier's probe sequence or release an active panel_test.
+		TE-on with vertical-blank output, not TE-off. The standard probe
+		sequence already uses parameterless 34h. This control resends TE-off
+		without releasing an active panel_test.
 		SPI errors propagate; other values return EINVAL. No automatic use.
 
 What:		/sys/bus/spi/devices/.../panel_reinit
@@ -136,10 +138,40 @@ Description:
 		current window, pulses physical reset low for 10..11 ms, releases
 		reset, waits 150 ms, replays the same validated supplier init used at
 		probe (including its delays), then sends DISPON. With the standard
-		sequence this restores FE/C4/3A/35/53/51/63/11/29 and takes about
-		760 ms plus transport. The probe path and defaults are unchanged.
+		sequence this restores FE/C4/3A/34/53/51/63/11/29 and takes about
+		760 ms plus transport. TE-off (34h) has no parameter, including at
+		probe; the other supplier commands and delays retain their order.
 		An active direct pattern is replayed after success; otherwise a full
 		framebuffer redraw is queued. Failure releases the test hold and
 		queues a framebuffer redraw. GPIO/SPI/sequence errors propagate;
 		other values return EINVAL. Recovery logs are kept out of fbcon so
 		they do not overwrite login memory. Runs only on explicit request.
+
+What:		/sys/bus/spi/devices/.../panel_reinit_draw
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only synchronous framebuffer recovery, also accessible through
+		/sys/class/graphics/fbN/device/panel_reinit_draw. Writing decimal 1
+		waits for the active window, releases any panel_test hold, pulses
+		physical reset and replays the full supplier init exactly as
+		panel_reinit does. It then renders the current framebuffer and sends
+		one full CASET/RASET/RAMWR before returning, retaining io_lock across
+		reset, initialization, rendering and the synchronous SPI transfer.
+		It neither queues deferred work nor modifies framebuffer memory.
+		Existing pending framebuffer work remains pending.
+
+		The standard sequence disables TE with parameterless 34h. A standard
+		landscape frame uses columns 22..431, rows 0..501 and 411640 payload
+		bytes. Normal flush_stats count this full-frame attempt; render_stats
+		also measure it when render_diagnostics is enabled. Reset/init errors
+		occur before the flush and are returned without a flush_stats sample.
+		Times in flush_stats exclude reset and supplier initialization delays.
+
+		Missing framebuffer/transfer buffers return ENODEV before reset and
+		preserve the test hold; other requests return EINVAL. GPIO, supplier
+		sequence and SPI errors propagate. After reset/transfer failure the
+		test hold stays released; no deferred replacement is queued. Runtime
+		command logs are suppressed so fbcon cannot overwrite login pixels.
+		Success reports completed SPI submission, not panel reception. Root
+		permission is required. Runs only on explicit request.

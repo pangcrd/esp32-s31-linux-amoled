@@ -16,6 +16,13 @@ args = parser.parse_args()
 source = args.source.read_text()
 masked = re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"',
                 lambda m: " " * len(m.group()), source, flags=re.S)
+dts = (args.source.resolve().parents[3] /
+       "arch/riscv/boot/dts/espressif/esp32s31_coreboard1_amoled.dts").read_text()
+board_init = bytes.fromhex(re.search(r"chipone,init-sequence\s*=\s*\[([^]]+)\]", dts)[1])
+assert board_init == bytes.fromhex(
+    "fe 01 00 00 00 c4 01 00 00 80 3a 01 00 00 55 34 00 00 00 "
+    "53 01 00 00 20 51 01 00 00 ff 63 01 00 00 ff 11 00 02 58"), \
+    "Board DT must retain supplier order/delays and use parameterless TE-off"
 
 
 def block(marker):
@@ -48,7 +55,7 @@ typedef uint64_t u64;
 typedef int spinlock_t;
 struct fb_deferred_io { unsigned long delay; };
 struct gpio_desc;
-struct mutex { int unused; };
+struct mutex { bool locked; };
 struct device { int unused; };
 struct spi_controller { u32 min_speed_hz, max_speed_hz; };
 struct spi_device {
@@ -98,7 +105,8 @@ struct spi_transfer {
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define SPI_NBITS_SINGLE 1
 #define SPI_NBITS_QUAD 4
-#define dev_info(...) ((void)0)
+static unsigned runtime_logs;
+#define dev_info(...) ((void)runtime_logs++)
 #define dev_err_ratelimited(...) ((void)0)
 #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
 #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
@@ -114,8 +122,17 @@ struct spi_transfer {
 #define PAGE_SIZE 4096
 static u64 ktime_get_ns(void) { static u64 now; return now += 1000; }
 static u64 div_u64(u64 n, u32 d) { return n / d; }
-static void mutex_lock(struct mutex *m) { (void)m; }
-static void mutex_unlock(struct mutex *m) { (void)m; }
+static void fail(const char *message);
+static struct mutex *locked_mutex;
+static unsigned lock_calls, unlock_calls;
+static void mutex_lock(struct mutex *m) {
+    if (m->locked || locked_mutex) fail("recursive io_lock acquisition");
+    m->locked = true; locked_mutex = m; lock_calls++;
+}
+static void mutex_unlock(struct mutex *m) {
+    if (!m->locked || locked_mutex != m) fail("unbalanced io_lock release");
+    m->locked = false; locked_mutex = NULL; unlock_calls++;
+}
 
 static unsigned int calls, phase, first_want, last_want, width, height;
 static unsigned int rotation;
@@ -131,7 +148,8 @@ static int reset_fail;
 static bool reinitializing, te_off, testing_panel;
 static unsigned init_calls, init_fail, test_calls, test_phase, test_windows, test_fail;
 static u32 test_mode;
-static bool custom_init;
+static bool custom_init, board_override, synchronous_draw;
+/* BOARD_INIT */
 static int gpiod_direction_output_raw(struct gpio_desc *reset, int value) {
     (void)reset;
     reset_calls++;
@@ -147,10 +165,10 @@ static void usleep_range(unsigned low, unsigned high) {
 }
 #define GFP_KERNEL 0
 static bool device_property_present(struct device *dev, const char *name) {
-    (void)dev; (void)name; return custom_init;
+    (void)dev; (void)name; return custom_init || board_override;
 }
 static int device_property_count_u8(struct device *dev, const char *name) {
-    (void)dev; (void)name; return 5;
+    (void)dev; (void)name; return board_override ? ARRAY_SIZE(board_init) : 5;
 }
 static void *devm_kmalloc(struct device *dev, size_t size, int flags) {
     static u8 memory[4096]; (void)dev; (void)flags;
@@ -159,7 +177,7 @@ static void *devm_kmalloc(struct device *dev, size_t size, int flags) {
 static int device_property_read_u8_array(struct device *dev, const char *name, u8 *out, size_t size) {
     const u8 invalid[] = { 0xfe, 2, 0, 0, 0 }; /* Record is truncated. */
     (void)dev; (void)name;
-    memcpy(out, invalid, size); return 0;
+    memcpy(out, board_override ? board_init : invalid, size); return 0;
 }
 static int gpiod_get_raw_value_cansleep(struct gpio_desc *reset) {
     (void)reset; return reset_raw;
@@ -175,14 +193,15 @@ static u16 pattern(unsigned int y, unsigned int x) {
 static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
                              unsigned int n) {
     (void)dev;
+    if (!locked_mutex) fail("SPI submission must remain under io_lock");
     const u8 *b = t[0].tx_buf;
     if (reinitializing) {
-        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x35, 0x53, 0x51, 0x63, 0x11, 0x29 };
+        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
         static const u8 values[] = { 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
         unsigned i = init_calls++;
-        if (n != 1 || i >= ARRAY_SIZE(commands) || t[0].len != (i < 7 ? 5 : 4) ||
+        if (n != 1 || i >= ARRAY_SIZE(commands) || t[0].len != (i < 7 && i != 3 ? 5 : 4) ||
             b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
-            (i < 7 && b[4] != values[i]))
+            (i < 7 && i != 3 && b[4] != values[i]))
             fail("full supplier reinit sequence and RGB565/TE parameters");
         if (i == 8) reinitializing = false;
         return init_fail == i + 1 ? -EIO : 0;
@@ -294,6 +313,7 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
 stub = r"""
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
                             unsigned long delay) {
+    if (synchronous_draw) fail("reinit_draw must never enqueue deferred work");
     struct co5300fb *p = info->par;
     if (delay == p->defio.delay) {
         if (first || last != p->height - 1) fail("rotation must redraw full frame");
@@ -474,6 +494,85 @@ static void capture(u32 first, u32 last) {
     first_want = first;
     last_want = last;
 }
+static ssize_t draw_attempt(struct fb_info *info, const char *request) {
+    struct co5300fb *p = info->par;
+    reinitializing = synchronous_draw = true;
+    init_calls = reset_calls = reset_us = sleep_ms = 0;
+    capture(0, p->height - 1);
+    unsigned locks = lock_calls, unlocks = unlock_calls, logs = runtime_logs;
+    ssize_t ret = panel_reinit_draw_store(&p->spi->dev, NULL, request, strlen(request));
+    if (p->io_lock.locked || locked_mutex || lock_calls != locks + 1 ||
+        unlock_calls != unlocks + 1 || runtime_logs != logs || p->quiet_commands)
+        fail("one uninterrupted io_lock and quiet logging for reset/init/render/RAMWR");
+    reinitializing = synchronous_draw = false;
+    return ret;
+}
+static void synchronous_recovery(struct fb_info *info) {
+    struct co5300fb *p = info->par;
+    /* Both fallback records and the actual board DT must disable TE. */
+    for (unsigned dt = 0; dt < 2; dt++) {
+        board_override = dt;
+        p->panel_test_active = true; p->panel_test_mode = 2;
+        memset(p->pixels, 0, p->width * p->height * 2);
+        u64 flushes = p->stats.flushes, samples = p->render_stats.samples;
+        /* Recovery is always full-frame even with partial updates enabled. */
+        partial_updates = true;
+        if (draw_attempt(info, "1\n") != 2 || init_calls != 9 || reset_calls != 1 ||
+            reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 ||
+            calls != 3 || phase != 3 || p->panel_test_active || p->panel_test_mode ||
+            p->stats.flushes != flushes + 1 || p->stats.full_flushes != flushes + 1 ||
+            p->stats.bytes != p->width * p->height * 2 || p->stats.errors ||
+            p->render_stats.samples != samples + 1)
+            fail("synchronous reinit must send current RGB565 framebuffer before returning");
+    }
+    board_override = false;
+    u64 flushes = p->stats.flushes, samples = p->render_stats.samples;
+    const char *invalid[] = { "0", "2", "-1", "0x1", "1junk", "", "4294967296" };
+    unsigned locks = lock_calls;
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
+        p->panel_test_active = true; p->panel_test_mode = 1;
+        if (panel_reinit_draw_store(&p->spi->dev, NULL, invalid[i], strlen(invalid[i])) != -EINVAL ||
+            lock_calls != locks || !p->panel_test_active || p->panel_test_mode != 1)
+            fail("invalid draw request must preserve state and do no I/O");
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        char *fb = info->screen_buffer; u8 *pixels = p->pixels, *command = p->command;
+        if (i == 0) info->screen_buffer = NULL;
+        if (i == 1) p->pixels = NULL;
+        if (i == 2) p->command = NULL;
+        if (draw_attempt(info, "1") != -ENODEV || reset_calls || init_calls || calls ||
+            !p->panel_test_active || p->panel_test_mode != 1)
+            fail("missing render/transfer buffers must fail before reset, preserving hold");
+        info->screen_buffer = fb; p->pixels = pixels; p->command = command;
+    }
+    reset_fail = -EIO;
+    if (draw_attempt(info, "1") != -EIO || reset_calls != 1 || init_calls || calls ||
+        p->panel_test_active || p->panel_test_mode)
+        fail("draw reset failure must propagate and release hold");
+    reset_fail = 0;
+    custom_init = true;
+    if (draw_attempt(info, "1") != -EINVAL || init_calls || calls)
+        fail("draw must reject a malformed supplier sequence before sending commands");
+    custom_init = false;
+    for (init_fail = 1; init_fail <= 9; init_fail++) {
+        p->panel_test_active = true; p->panel_test_mode = 1;
+        if (draw_attempt(info, "1") != -EIO || init_calls != init_fail || calls ||
+            p->panel_test_active || p->panel_test_mode)
+            fail("draw init failure must stop before rendering/SPI and release hold");
+    }
+    init_fail = 0;
+    if (p->stats.flushes != flushes || p->render_stats.samples != samples)
+        fail("reset/init failure must not count a framebuffer flush/render");
+    for (injected = 1; injected <= 3; injected++) {
+        if (draw_attempt(info, "1") != -EIO || init_calls != 9 || calls != injected ||
+            p->stats.flushes != flushes + injected || p->stats.errors != injected ||
+            p->stats.full_flushes != flushes)
+            fail("draw CASET/RASET/RAMWR failures must propagate and update normal stats");
+    }
+    injected = 0;
+    p->stats = (struct co5300fb_stats) {0};
+    p->render_stats = (struct co5300fb_render_stats) {0};
+}
 static void run(struct fb_info *info, struct list_head *pages, u32 first, u32 last) {
     struct co5300fb *p = info->par;
     p->dirty = true;
@@ -499,6 +598,8 @@ static void geometry(u32 w, u32 h, u32 rot) {
             vmem[y*w+x] = pattern(y, x);
     struct fb_info info = { .par = &p, .screen_buffer = (char *)vmem,
                            .fix = { .line_length = w*2, .smem_len = w*h*2 } };
+    spi.data = &info;
+    synchronous_recovery(&info);
     struct list_head pages = {0};
     partial_updates = false;
     p.dirty = true; p.first = p.last = h / 2;
@@ -570,18 +671,22 @@ int main(void) {
         geometry(512, 512, rot);
     }
     puts("PASS: default full refresh and opt-in partial/mmap windows at all rotations, RGB565 rotation,"
-         " mixed-lane CS, direct patterns/hold/release/errors, full reinit/TE-off and render diagnostics");
+         " mixed-lane CS, direct patterns/hold/release/errors, fallback + board DT TE-off,"
+         " synchronous reinit_draw under one lock without deferred work, errors and render diagnostics");
     return 0;
 }
 """
 program = "\n".join([
-    header, block("struct co5300fb_stats {"), block("struct co5300fb_render_stats {"),
+    header.replace("/* BOARD_INIT */", "static const u8 board_init[] = {" +
+                   ",".join(str(b) for b in board_init) + "};"),
+    block("struct co5300fb_stats {"), block("struct co5300fb_render_stats {"),
     block("struct co5300fb_panel_test_stats {"),
     block("struct co5300fb {"), stub,
     block("static int co5300fb_command("),
     block("static int co5300fb_write_window("),
     block("static void co5300fb_render("),
     block("static void co5300fb_measure_render("),
+    block("static int co5300fb_flush_locked("),
     block("static int co5300fb_flush("),
     block("static ssize_t spi_freq_hz_show("),
     block("static ssize_t spi_freq_hz_store("),
@@ -595,6 +700,7 @@ program = "\n".join([
     block("static ssize_t panel_te_off_store("),
     block("static int co5300fb_init_sequence("),
     block("static int co5300fb_reset_and_init("),
+    block("static ssize_t panel_reinit_draw_store("),
     block("static ssize_t panel_reinit_store("),
     block("static void co5300fb_deferred_io("), main,
 ])

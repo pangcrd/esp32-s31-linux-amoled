@@ -53,10 +53,21 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int spinlock_t;
-struct mutex { int unused; };
+struct mutex { bool locked; };
 struct gpio_desc;
 struct device { int unused; };
-struct spi_device { struct device dev; };
+struct spi_device { struct device dev; void *data; };
+struct device_attribute;
+#define to_spi_device(dev) ((struct spi_device *)(dev))
+static void *spi_get_drvdata(struct spi_device *spi) { return spi->data; }
+static int kstrtou32(const char *buf, int base, u32 *value) {
+    char *end;
+    if (*buf == '-') return -EINVAL;
+    errno = 0;
+    unsigned long n = strtoul(buf, &end, base);
+    if (errno || end == buf || n > UINT32_MAX || (*end && strcmp(end, "\n"))) return -EINVAL;
+    *value = n; return 0;
+}
 struct fb_info;
 struct vm_area_struct;
 struct fb_fillrect { u32 dx, dy, width, height, color, rop; };
@@ -134,8 +145,46 @@ struct spi_transfer { const void *tx_buf; u32 len; u8 tx_nbits; };
 #define PAGE_SIZE 4096
 static bool partial_updates;
 static bool render_diagnostics = true;
-static void mutex_lock(struct mutex *m) { (void)m; }
-static void mutex_unlock(struct mutex *m) { (void)m; }
+static void fail(const char *s);
+static struct mutex *locked_mutex;
+static unsigned lock_calls, scheduled;
+static void mutex_lock(struct mutex *m) {
+    if (m->locked || locked_mutex) fail("recursive io_lock");
+    m->locked = true; locked_mutex = m; lock_calls++;
+}
+static void mutex_unlock(struct mutex *m) {
+    if (!m->locked || locked_mutex != m) fail("unbalanced io_lock");
+    m->locked = false; locked_mutex = NULL;
+}
+static bool recovering;
+static unsigned init_phase, reset_calls, reset_us, sleep_ms;
+static int reset_raw;
+static int gpiod_direction_output_raw(struct gpio_desc *reset, int value) {
+    (void)reset;
+    if (!locked_mutex) fail("reset must hold io_lock");
+    reset_calls++; reset_raw = value; return 0;
+}
+static void gpiod_set_raw_value_cansleep(struct gpio_desc *reset, int value) {
+    (void)reset;
+    if (!locked_mutex) fail("reset release must hold io_lock");
+    reset_raw = value;
+}
+static int gpiod_get_raw_value_cansleep(struct gpio_desc *reset) { (void)reset; return reset_raw; }
+static void usleep_range(unsigned low, unsigned high) { (void)high; reset_us += low; }
+static void msleep(unsigned ms) { sleep_ms += ms; }
+#define GFP_KERNEL 0
+static bool device_property_present(struct device *dev, const char *name) {
+    (void)dev; (void)name; return false;
+}
+static int device_property_count_u8(struct device *dev, const char *name) {
+    (void)dev; (void)name; return -EINVAL;
+}
+static void *devm_kmalloc(struct device *dev, size_t size, int flags) {
+    (void)dev; (void)size; (void)flags; return NULL;
+}
+static int device_property_read_u8_array(struct device *dev, const char *name, u8 *out, size_t size) {
+    (void)dev; (void)name; (void)out; (void)size; return -EINVAL;
+}
 static u64 ktime_get_ns(void) { static u64 n; return n += 1000; }
 static u64 div_u64(u64 n, u32 d) { return n / d; }
 static bool fb_be_math(struct fb_info *info) { (void)info; return false; }
@@ -147,6 +196,7 @@ static unsigned long copy_to_user(void *to, const void *from, size_t count) {
 }
 static bool schedule_delayed_work(void *work, unsigned long delay) {
     (void)delay;
+    scheduled++;
     bool *pending = work;
     bool old = *pending;
     *pending = true;
@@ -163,7 +213,17 @@ static unsigned phase;
 static void fail(const char *s) { fprintf(stderr, "FAIL: %s\n", s); exit(2); }
 static int spi_sync_transfer(struct spi_device *spi, struct spi_transfer *t, unsigned n) {
     (void)spi;
+    if (!locked_mutex) fail("SPI must hold io_lock");
     const u8 *b = t[0].tx_buf;
+    if (recovering && init_phase < 9) {
+        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
+        static const u8 values[] = { 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
+        unsigned i = init_phase++;
+        if (n != 1 || t[0].len != (i < 7 && i != 3 ? 5 : 4) ||
+            t[0].tx_nbits != 1 || b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
+            (i < 7 && i != 3 && b[4] != values[i])) fail("TE-off supplier init before Tux RAMWR");
+        return 0;
+    }
     if (phase < 2) {
         if (n != 1 || t[0].len != 8 || b[2] != (phase ? 0x2b : 0x2a)) fail("window command");
         unsigned first = ((unsigned)b[4] << 8) | b[5];
@@ -209,6 +269,7 @@ int main(int argc, char **argv) {
         .fix = { .line_length = 1004, .smem_len = 411640, .visual = FB_VISUAL_TRUECOLOR },
         .screen_size = 411640, .var = { .xres = 502, .yres = 410, .bits_per_pixel = 16 },
         .pseudo_palette = p.palette, .fbops = &co5300fb_ops, .fbdefio = &p.defio };
+    spi.data = &info;
     info.screen_buffer = calloc(1, 411648);
     p.pixels = calloc(1, 411640); p.command = calloc(1, 259); active = &info;
     if (!info.screen_buffer || !p.pixels || !p.command) fail("allocation");
@@ -246,6 +307,23 @@ int main(int argc, char **argv) {
         if (info.fbops->fb_read(&info, readback, 460, &pos) != 460 || memcmp(readback, tux + y * 460, 460)) fail("Tux rectangle readback");
     }
     if (((u16 *)info.screen_buffer)[240 * 502 + 265] != 0xffff) fail("known white belly at (265,240)");
+    /* Run the actual sysfs store while Tux writes are still pending. Its
+     * return must mean Tux has already been sent, without draining work. */
+    unsigned locks = lock_calls, queued = scheduled;
+    u64 full_flushes = p.stats.full_flushes;
+    p.panel_test_active = true; p.panel_test_mode = 2;
+    memset(p.pixels, 0, 411640);
+    phase = 0; recovering = true;
+    if (panel_reinit_draw_store(&spi.dev, NULL, "1\n", 2) != 2 || init_phase != 9 || phase != 3 ||
+        reset_calls != 1 || reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 ||
+        lock_calls != locks + 1 || locked_mutex || p.io_lock.locked ||
+        scheduled != queued || !info.deferred_work.pending || !p.dirty ||
+        p.panel_test_active || p.panel_test_mode || p.quiet_commands ||
+        p.stats.full_flushes != full_flushes + 1 || p.stats.errors ||
+        p.render_stats.fb_sample != 0xffff || p.render_stats.tx_sample != 0xffff ||
+        p.render_stats.sample_offset != 217638)
+        fail("one-lock synchronous reset/init must submit the actual Tux before returning and preserve pending damage");
+    recovering = false;
     drain(&info, &pages);
     if (p.render_stats.fb_sample != 0xffff || p.render_stats.tx_sample != 0xffff ||
         p.render_stats.sample_offset != 217638 || p.render_stats.bytes != 411640 ||
@@ -281,6 +359,7 @@ int main(int argc, char **argv) {
     pages.first = &page; drain(&info, &pages);
     free(white); free(readback); free(tux); co5300fb_destroy(&info);
     puts("PASS: actual Linux sysmem/deferred macros, 8-byte/full-frame/Tux writes and readback,"
+         " synchronous one-lock reset/init/Tux RAMWR before return with pending work preserved,"
          " glyph/fill/copy damage, held-pattern canonical restoration, mmap pages and full-frame RGB565 SPI");
     return 0;
 }
@@ -302,7 +381,9 @@ for file, name in (("sysimgblt.c", "sys_imageblit"), ("sysfillrect.c", "sys_fill
 program += [macros, block(driver, "struct co5300fb_stats {"),
             block(driver, "struct co5300fb_render_stats {"),
             block(driver, "struct co5300fb_panel_test_stats {"), block(driver, "struct co5300fb {")]
-for name in ("co5300fb_command", "co5300fb_write_window", "co5300fb_render", "co5300fb_measure_render", "co5300fb_flush", "co5300fb_damage",
+for name in ("co5300fb_command", "co5300fb_write_window", "co5300fb_render", "co5300fb_measure_render",
+             "co5300fb_flush_locked", "co5300fb_flush", "co5300fb_init_sequence",
+             "co5300fb_reset_and_init", "panel_reinit_draw_store", "co5300fb_damage",
              "co5300fb_damage_range", "co5300fb_damage_area"):
     program.append(block(driver, name))
 start = driver.index("FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(")
