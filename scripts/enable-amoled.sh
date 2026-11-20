@@ -15,6 +15,10 @@ grep -q 'linux-coreboard1.fragment' "$out/.config" ||
 if ! grep -q 'linux-amoled.fragment' "$out/.config"; then
 	sed -i '/^BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES=/s@"$@ $(BR2_EXTERNAL_ESP32S31_PATH)/board/esp32s31/linux-amoled.fragment"@' "$out/.config"
 fi
+if ! grep -q '^BR2_PACKAGE_CO5300_SPLASH=y$' "$out/.config"; then
+	sed -i '/^# BR2_PACKAGE_CO5300_SPLASH is not set$/d' "$out/.config"
+	printf '%s\n' 'BR2_PACKAGE_CO5300_SPLASH=y' >> "$out/.config"
+fi
 make -C "$repo/external/buildroot" O="$out" BR2_EXTERNAL="$repo/br2-external" olddefconfig
 make -C "$repo/external/buildroot" O="$out" BR2_EXTERNAL="$repo/br2-external" linux-dirclean
 echo "AMOLED console enabled. Build this output without reapplying coreboard1_defconfig."

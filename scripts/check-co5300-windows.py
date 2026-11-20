@@ -36,15 +36,44 @@ header = r"""
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <sys/types.h>
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int spinlock_t;
-struct fb_deferred_io { int unused; };
+struct fb_deferred_io { unsigned long delay; };
 struct gpio_desc;
+struct mutex { int unused; };
 struct device { int unused; };
-struct spi_device { struct device dev; };
+struct spi_controller { u32 min_speed_hz, max_speed_hz; };
+struct spi_device {
+    struct device dev;
+    struct spi_controller *controller;
+    void *data;
+    u32 max_speed_hz;
+};
+struct device_attribute { int unused; };
+#define to_spi_device(dev) ((struct spi_device *)(dev))
+static void *spi_get_drvdata(struct spi_device *spi) { return spi->data; }
+static int sysfs_emit(char *buf, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, 4096, fmt, ap);
+    va_end(ap);
+    return n;
+}
+static int kstrtou32(const char *buf, int base, u32 *value) {
+    char *end;
+    if (*buf == '-') return -EINVAL;
+    errno = 0;
+    unsigned long long n = strtoull(buf, &end, base);
+    if (errno || end == buf || n > UINT32_MAX ||
+        (*end && strcmp(end, "\n"))) return -EINVAL;
+    *value = n;
+    return 0;
+}
 struct fb_info {
     void *par;
     char *screen_buffer;
@@ -62,6 +91,7 @@ struct spi_transfer {
     bool cs_change;
 };
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define SPI_NBITS_SINGLE 1
 #define SPI_NBITS_QUAD 4
@@ -80,9 +110,13 @@ struct spi_transfer {
 #define PAGE_SIZE 4096
 static u64 ktime_get_ns(void) { static u64 now; return now += 1000; }
 static u64 div_u64(u64 n, u32 d) { return n / d; }
+static void mutex_lock(struct mutex *m) { (void)m; }
+static void mutex_unlock(struct mutex *m) { (void)m; }
 
 static unsigned int calls, phase, first_want, last_want, width, height;
+static unsigned int rotation;
 static unsigned int xoff, yoff, injected, retries, retry_first, retry_last;
+static unsigned int refreshes;
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     exit(2);
@@ -108,11 +142,18 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
         if ((start & 1) || end < start || ((end - start + 1) & 1))
             fail("CO5300 requires even start and extent");
         if (!phase) {
-            if (start != yoff + height - 1 - last_want ||
-                end != yoff + height - 1 - first_want)
+            u32 lo = rotation == 90 || rotation == 270 ? 0 :
+                     rotation == 180 ? first_want : height - 1 - last_want;
+            u32 hi = rotation == 90 || rotation == 270 ? width - 1 :
+                     rotation == 180 ? last_want : height - 1 - first_want;
+            if (start != yoff + lo || end != yoff + hi)
                 fail("mirrored partial CASET window");
         } else {
-            if (start != xoff || end != xoff + width - 1)
+            u32 lo = rotation == 90 ? first_want :
+                     rotation == 270 ? height - 1 - last_want : 0;
+            u32 hi = rotation == 90 ? last_want :
+                     rotation == 270 ? height - 1 - first_want : width - 1;
+            if (start != xoff + lo || end != xoff + hi)
                 fail("native RASET window");
         }
         phase++;
@@ -124,11 +165,21 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
         t[1].tx_nbits != 4 || t[1].cs_change || t[1].len != width * rows * 2)
         fail("one single header + quad RGB565 payload in one CS assertion");
     b = t[1].tx_buf;
-    /* Independent reference: each logical column, bottom to top. */
-    for (u32 x = 0; x < width; x++) {
-        for (u32 i = 0; i < rows; i++) {
-            u16 expected = pattern(last_want - i, x);
-            u32 off = (x * rows + i) * 2;
+    /* Independent inverse mapping from GRAM row/column to logical pixels. */
+    bool portrait = rotation == 90 || rotation == 270;
+    u32 columns = portrait ? width : rows;
+    u32 gram_rows = portrait ? rows : width;
+    for (u32 r = 0; r < gram_rows; r++) {
+        for (u32 c = 0; c < columns; c++) {
+            u32 x, y;
+            switch (rotation) {
+            case 90: x = c; y = first_want + r; break;
+            case 180: x = width - 1 - r; y = first_want + c; break;
+            case 270: x = width - 1 - c; y = last_want - r; break;
+            default: x = r; y = last_want - c; break;
+            }
+            u16 expected = pattern(y, x);
+            u32 off = (r * columns + c) * 2;
             if (b[off] != (expected >> 8) || b[off+1] != (expected & 255))
                 fail("clockwise rotation / RGB565 wire bytes");
         }
@@ -140,7 +191,12 @@ static int spi_sync_transfer(struct spi_device *dev, struct spi_transfer *t,
 stub = r"""
 static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
                             unsigned long delay) {
-    (void)info;
+    struct co5300fb *p = info->par;
+    if (delay == p->defio.delay) {
+        if (first || last != p->height - 1) fail("rotation must redraw full frame");
+        refreshes++;
+        return;
+    }
     if (delay != HZ) fail("bounded retry delay");
     retries++;
     retry_first = first;
@@ -148,6 +204,50 @@ static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
 }
 """
 main = r"""
+static void settings(void) {
+    struct spi_controller ctlr = { .min_speed_hz = 78125, .max_speed_hz = 80000000 };
+    struct spi_device spi = { .controller = &ctlr, .max_speed_hz = 40000000 };
+    struct co5300fb p = { .spi = &spi, .width = 502, .height = 410,
+                         .defio = { .delay = 4 } };
+    struct fb_info info = { .par = &p };
+    spi.data = &info;
+    struct device *dev = &spi.dev;
+    char buf[4096];
+    const char *valid[] = { "78125", "20000000\n", "80000000" };
+    for (u32 i = 0; i < ARRAY_SIZE(valid); i++) {
+        size_t len = strlen(valid[i]);
+        if (spi_freq_hz_store(dev, NULL, valid[i], len) != (ssize_t)len)
+            fail("valid clock / controller bounds");
+    }
+    if (spi_freq_hz_show(dev, NULL, buf) <= 0 || strcmp(buf, "80000000\n"))
+        fail("clock readback");
+    const char *invalid[] = { "0", "78124", "80000001", "-1", "4294967296",
+                             "banana", "", "40000000 garbage" };
+    for (u32 i = 0; i < ARRAY_SIZE(invalid); i++)
+        if (spi_freq_hz_store(dev, NULL, invalid[i], strlen(invalid[i])) != -EINVAL ||
+            spi.max_speed_hz != 80000000)
+            fail("invalid clock must preserve old setting");
+    refreshes = 0;
+    if (rotation_store(dev, NULL, "180\n", 4) != 4 || p.rotation != 180 || refreshes != 1)
+        fail("landscape flip and full refresh");
+    if (rotation_show(dev, NULL, buf) <= 0 || strcmp(buf, "180\n"))
+        fail("rotation readback");
+    if (rotation_store(dev, NULL, "180", 3) != 3 || refreshes != 1)
+        fail("unchanged rotation should not flush");
+    const char *badrot[] = { "90", "270", "45", "360", "-180", "abc", "4294967296" };
+    for (u32 i = 0; i < ARRAY_SIZE(badrot); i++)
+        if (rotation_store(dev, NULL, badrot[i], strlen(badrot[i])) != -EINVAL ||
+            p.rotation != 180 || refreshes != 1)
+            fail("invalid/dimension-changing rotation");
+    if (rotation_store(dev, NULL, "0", 1) != 1 || p.rotation || refreshes != 2)
+        fail("restore landscape");
+    p.rotation = 90; p.width = 410; p.height = 502;
+    if (rotation_store(dev, NULL, "270", 3) != 3 || p.rotation != 270 || refreshes != 3 ||
+        rotation_store(dev, NULL, "0", 1) != -EINVAL ||
+        rotation_store(dev, NULL, "180", 3) != -EINVAL ||
+        rotation_store(dev, NULL, "90", 2) != 2 || p.rotation != 90 || refreshes != 4)
+        fail("portrait flip must preserve dimensions");
+}
 static void capture(u32 first, u32 last) {
     calls = phase = retries = 0;
     first_want = first;
@@ -163,11 +263,12 @@ static void run(struct fb_info *info, struct list_head *pages, u32 first, u32 la
     if (calls != 3 || phase != 3 || retries)
         fail("one window / two commands / one pixel message");
 }
-static void geometry(u32 w, u32 h) {
+static void geometry(u32 w, u32 h, u32 rot) {
     struct spi_device spi = {0};
     struct co5300fb p = { .spi = &spi, .width = w, .height = h,
-                         .xoff = 0, .yoff = 22 };
+                         .xoff = 0, .yoff = 22, .rotation = rot };
     width = w; height = h; xoff = p.xoff; yoff = p.yoff;
+    rotation = rot;
     p.command = calloc(259, 1);
     p.pixels = malloc(w * h * 2);
     u16 *vmem = malloc(w * h * sizeof(*vmem));
@@ -224,11 +325,14 @@ static void geometry(u32 w, u32 h) {
     free(p.command); free(p.pixels); free(vmem);
 }
 int main(void) {
-    geometry(502, 410);
-    geometry(2, 2);
-    geometry(512, 512);
-    puts("PASS: landscape/full/partial/mmap windows, exact RGB565 rotation,"
-         " mixed-lane CS, tile edges, failure retry and stats");
+    settings();
+    for (u32 rot = 0; rot <= 270; rot += 90) {
+        geometry(rot % 180 ? 410 : 502, rot % 180 ? 502 : 410, rot);
+        geometry(2, 2, rot);
+        geometry(512, 512, rot);
+    }
+    puts("PASS: all four rotations/full/partial/mmap windows, exact RGB565 rotation,"
+         " mixed-lane CS, tile edges, failure retry, stats and sysfs validation");
     return 0;
 }
 """
@@ -237,6 +341,10 @@ program = "\n".join([
     block("static int co5300fb_command("),
     block("static void co5300fb_render("),
     block("static int co5300fb_flush("),
+    block("static ssize_t spi_freq_hz_show("),
+    block("static ssize_t spi_freq_hz_store("),
+    block("static ssize_t rotation_show("),
+    block("static ssize_t rotation_store("),
     block("static void co5300fb_deferred_io("), main,
 ])
 with tempfile.TemporaryDirectory(prefix="co5300-windows-") as temp:

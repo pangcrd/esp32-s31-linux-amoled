@@ -19,3 +19,31 @@ Description:
 		sample even after a partial/cursor update. max_full_us is the maximum
 		successful full-frame total since probe. Counters are per device and
 		reset at probe. Reading this file neither logs nor flushes.
+
+What:		/sys/bus/spi/devices/.../spi_freq_hz
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read/write requested SPI frequency in decimal Hz. Accessible also
+		through /sys/class/graphics/fbN/device/spi_freq_hz. Accepts nonzero
+		values in the SPI controller's min_speed_hz..max_speed_hz range;
+		invalid values return EINVAL. Defaults to spi-max-frequency in DT
+		(40000000 on this board). Hardware divider rounding may lower the
+		actual clock. A write waits for an active window to finish and
+		changes subsequent transfers; no reboot is needed. Frequencies
+		above 40 MHz have not been board-tested. Resets at probe/reboot.
+
+What:		/sys/bus/spi/devices/.../rotation
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Read/write software rotation in degrees relative to landscape.
+		Accessible also through /sys/class/graphics/fbN/device/rotation.
+		At the default DT rotation 0, accepts 0 or 180 without changing
+		the 502x410 framebuffer, stride or fbcon layout. Writes schedule a
+		complete refresh. Portrait requires DT rotation = <90> or <270>
+		and a kernel/DTB rebuild and reboot; the framebuffer then becomes
+		410x502 and runtime writes accept 90 or 270. Other values and
+		changes between portrait/landscape return EINVAL. The GRAM window
+		alignment and the symmetric 40-pixel content inset are preserved.
+		Resets to the DT setting at probe/reboot. Reading does not flush.

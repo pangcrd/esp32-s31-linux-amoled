@@ -9,6 +9,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/sched.h>
 #include <linux/spi/spi.h>
@@ -27,8 +28,10 @@ struct co5300fb {
 	struct gpio_desc *reset;
 	struct fb_deferred_io defio;
 	spinlock_t damage_lock;
+	struct mutex io_lock; /* Serialize complete windows and runtime settings. */
 	bool dirty, stopped;
 	u32 first, last, width, height, xoff, yoff;
+	u32 rotation;
 	struct co5300fb_stats stats; /* Protected by damage_lock. */
 	u32 palette[16];
 	u8 *command, *pixels;
@@ -63,11 +66,13 @@ static int co5300fb_command(struct co5300fb *p, u8 cmd,
 }
 
 /*
- * Keep the proven clockwise software rotation:
+ * Rotation 0 keeps the proven clockwise software mapping:
  * logical (x, y) -> GRAM (yoff + height - 1 - y, xoff + x).
  * xoff/yoff describe the unrotated logical axes for the existing DT.
  * Read 16x16 tiles to avoid a full-height strided source scan. Output is
  * still row-major GRAM order, RGB565 MSB first, in one even-sized window.
+ * Rotation is relative to this landscape view; portrait is selected at
+ * probe time so fbcon and mmap never see changing framebuffer dimensions.
  */
 static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 {
@@ -84,7 +89,26 @@ static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 
 			for (y = yb; y < ye; y++) {
 				const u16 *src = fb + y * p->width + xb;
-				u32 offset = 2 * (xb * rows + last - y);
+				u32 offset, step;
+
+				switch (p->rotation) {
+				case 180:
+					offset = 2 * ((p->width - 1 - xb) * rows + y - first);
+					step = rows * 2;
+					break;
+				case 90:
+					offset = 2 * ((y - first) * p->width + xb);
+					step = 2;
+					break;
+				case 270:
+					offset = 2 * ((last - y) * p->width + p->width - 1 - xb);
+					step = 2;
+					break;
+				default:
+					offset = 2 * (xb * rows + last - y);
+					step = rows * 2;
+					break;
+				}
 
 				for (x = xb; x < xe; x++) {
 					u16 pixel = READ_ONCE(*src++);
@@ -92,7 +116,10 @@ static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 
 					dst[0] = pixel >> 8;
 					dst[1] = pixel;
-					offset += rows * 2;
+					if (p->rotation == 180 || p->rotation == 270)
+						offset -= step;
+					else
+						offset += step;
 				}
 			}
 		}
@@ -103,19 +130,30 @@ static void co5300fb_render(struct fb_info *info, u32 first, u32 last)
 static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 {
 	struct co5300fb *p = info->par;
-	u32 cfirst = p->yoff + p->height - 1 - last;
-	u32 clast = p->yoff + p->height - 1 - first;
-	u32 rend = p->xoff + p->width - 1;
+	u32 cfirst, clast, rfirst, rlast;
 	u8 address[4];
 	struct spi_transfer t[2] = {
 		{ .tx_buf = p->command, .len = 4, .tx_nbits = SPI_NBITS_SINGLE },
 		{ .tx_buf = p->pixels, .len = p->width * (last - first + 1) * 2,
 		  .tx_nbits = SPI_NBITS_QUAD },
 	};
-	u64 begin = ktime_get_ns(), rendered, finish;
+	u64 begin, rendered, finish;
 	unsigned long flags;
 	int ret;
 
+	mutex_lock(&p->io_lock);
+	begin = ktime_get_ns();
+	if (p->rotation == 90 || p->rotation == 270) {
+		cfirst = p->yoff;
+		clast = p->yoff + p->width - 1;
+		rfirst = p->xoff + (p->rotation == 90 ? first : p->height - 1 - last);
+		rlast = p->xoff + (p->rotation == 90 ? last : p->height - 1 - first);
+	} else {
+		cfirst = p->yoff + (p->rotation == 180 ? first : p->height - 1 - last);
+		clast = p->yoff + (p->rotation == 180 ? last : p->height - 1 - first);
+		rfirst = p->xoff;
+		rlast = p->xoff + p->width - 1;
+	}
 	co5300fb_render(info, first, last);
 	rendered = ktime_get_ns();
 	address[0] = cfirst >> 8;
@@ -125,10 +163,10 @@ static int co5300fb_flush(struct fb_info *info, u32 first, u32 last)
 	ret = co5300fb_command(p, 0x2a, address, sizeof(address));
 	if (ret)
 		goto done;
-	address[0] = p->xoff >> 8;
-	address[1] = p->xoff;
-	address[2] = rend >> 8;
-	address[3] = rend;
+	address[0] = rfirst >> 8;
+	address[1] = rfirst;
+	address[2] = rlast >> 8;
+	address[3] = rlast;
 	ret = co5300fb_command(p, 0x2b, address, sizeof(address));
 	if (ret)
 		goto done;
@@ -157,6 +195,7 @@ done:
 		p->stats.max_full_us = max(p->stats.max_full_us, p->stats.total_us);
 	}
 	spin_unlock_irqrestore(&p->damage_lock, flags);
+	mutex_unlock(&p->io_lock);
 	return ret;
 }
 
@@ -184,8 +223,74 @@ static ssize_t flush_stats_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(flush_stats);
 
+static void co5300fb_damage(struct fb_info *info, u32 first, u32 last,
+			    unsigned long delay);
+
+static ssize_t spi_freq_hz_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(to_spi_device(dev)->max_speed_hz));
+}
+
+static ssize_t spi_freq_hz_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct spi_device *spi = to_spi_device(dev);
+	struct fb_info *info = spi_get_drvdata(spi);
+	struct co5300fb *p = info->par;
+	u32 hz;
+
+	if (kstrtou32(buf, 10, &hz) || !hz ||
+	    hz < spi->controller->min_speed_hz || hz > spi->controller->max_speed_hz)
+		return -EINVAL;
+	/* All transfers use the SPI device default speed. Do not change it
+	 * between CASET, RASET and RAMWR of a deferred-I/O window. */
+	mutex_lock(&p->io_lock);
+	WRITE_ONCE(spi->max_speed_hz, hz);
+	mutex_unlock(&p->io_lock);
+	return count;
+}
+static DEVICE_ATTR_RW(spi_freq_hz);
+
+static ssize_t rotation_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(p->rotation));
+}
+
+static ssize_t rotation_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct fb_info *info = spi_get_drvdata(to_spi_device(dev));
+	struct co5300fb *p = info->par;
+	u32 rotation;
+
+	if (kstrtou32(buf, 10, &rotation) || rotation > 270 || rotation % 90)
+		return -EINVAL;
+	mutex_lock(&p->io_lock);
+	/* Keep dimensions, stride, fbcon and existing mmap mappings stable. */
+	if (rotation % 180 != p->rotation % 180) {
+		mutex_unlock(&p->io_lock);
+		return -EINVAL;
+	}
+	if (rotation != p->rotation) {
+		WRITE_ONCE(p->rotation, rotation);
+		co5300fb_damage(info, 0, p->height - 1, p->defio.delay);
+	}
+	mutex_unlock(&p->io_lock);
+	return count;
+}
+static DEVICE_ATTR_RW(rotation);
+
 static struct attribute *co5300fb_attrs[] = {
 	&dev_attr_flush_stats.attr,
+	&dev_attr_spi_freq_hz.attr,
+	&dev_attr_rotation.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(co5300fb);
@@ -380,6 +485,7 @@ static int co5300fb_probe(struct spi_device *spi)
 	p = info->par;
 	p->spi = spi;
 	spin_lock_init(&p->damage_lock);
+	mutex_init(&p->io_lock);
 	/* Defaults are the C05300AF-51 module on this shield, landscape
 	 * (502x410) via software rotation; DT properties
 	 * (chipone,width/height/x-offset/y-offset) override them. */
@@ -391,12 +497,16 @@ static int co5300fb_probe(struct spi_device *spi)
 	device_property_read_u32(dev, "chipone,height", &p->height);
 	device_property_read_u32(dev, "chipone,x-offset", &p->xoff);
 	device_property_read_u32(dev, "chipone,y-offset", &p->yoff);
+	device_property_read_u32(dev, "rotation", &p->rotation);
 	if (!p->width || !p->height || p->width > 512 || p->height > 512 ||
 	    p->xoff > 65535 - p->width || p->yoff > 65535 - p->height ||
-	    ((p->width | p->height | p->xoff | p->yoff) & 1)) {
+	    ((p->width | p->height | p->xoff | p->yoff) & 1) ||
+	    p->rotation > 270 || p->rotation % 90) {
 		ret = -EINVAL;
 		goto fail;
 	}
+	if (p->rotation == 90 || p->rotation == 270)
+		swap(p->width, p->height);
 	spi->mode &= ~(SPI_CPOL | SPI_CPHA | SPI_LSB_FIRST);
 	spi->mode |= SPI_TX_QUAD;
 	spi->bits_per_word = 8;

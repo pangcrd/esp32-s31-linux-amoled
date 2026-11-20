@@ -72,6 +72,15 @@ properties:
       CO5300 MADCTL does not provide row/column exchange.
       Geometry plus offsets must fit in 16-bit column/row addresses.
 
+  rotation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: |
+      Software rotation in degrees relative to the default landscape view.
+      90/270 swap the framebuffer dimensions at probe time. Geometry and
+      offsets above always describe the default landscape GRAM rectangle.
+    enum: [0, 90, 180, 270]
+    default: 0
+
 required:
   - compatible
   - reg
