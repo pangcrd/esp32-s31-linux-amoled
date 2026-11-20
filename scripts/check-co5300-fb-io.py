@@ -133,6 +133,7 @@ struct spi_transfer { const void *tx_buf; u32 len; u8 tx_nbits; };
 #define HZ 100
 #define PAGE_SIZE 4096
 static bool partial_updates;
+static bool render_diagnostics = true;
 static void mutex_lock(struct mutex *m) { (void)m; }
 static void mutex_unlock(struct mutex *m) { (void)m; }
 static u64 ktime_get_ns(void) { static u64 n; return n += 1000; }
@@ -246,6 +247,10 @@ int main(int argc, char **argv) {
     }
     if (((u16 *)info.screen_buffer)[240 * 502 + 265] != 0xffff) fail("known white belly at (265,240)");
     drain(&info, &pages);
+    if (p.render_stats.fb_sample != 0xffff || p.render_stats.tx_sample != 0xffff ||
+        p.render_stats.sample_offset != 217638 || p.render_stats.bytes != 411640 ||
+        !p.render_stats.nonzero_bytes)
+        fail("known belly must be measured at byte 217638 before SPI submission");
     co5300fb_setcolreg(7, 65535, 65535, 65535, 0, &info);
     char bitmap[44]; memset(bitmap, 255, sizeof(bitmap));
     struct fb_image glyph = { .dx = 48, .dy = 66, .width = 12, .height = 22,
@@ -267,7 +272,7 @@ int main(int argc, char **argv) {
     pages.first = &page; drain(&info, &pages);
     free(white); free(readback); free(tux); co5300fb_destroy(&info);
     puts("PASS: actual Linux sysmem/deferred macros, 8-byte/full-frame/Tux writes and readback,"
-         " glyph/fill/copy damage, mmap pages and captured full-frame RGB565 SPI");
+         " glyph/fill/copy damage, mmap pages, pre-SPI belly diagnostics and full-frame RGB565 SPI");
     return 0;
 }
 '''
@@ -285,8 +290,9 @@ for name in ("fb_sys_read", "fb_sys_write"):
 for file, name in (("sysimgblt.c", "sys_imageblit"), ("sysfillrect.c", "sys_fillrect"),
                    ("syscopyarea.c", "sys_copyarea")):
     program.append(block((core / file).read_text(), name))
-program += [macros, block(driver, "struct co5300fb_stats {"), block(driver, "struct co5300fb {")]
-for name in ("co5300fb_command", "co5300fb_render", "co5300fb_flush", "co5300fb_damage",
+program += [macros, block(driver, "struct co5300fb_stats {"),
+            block(driver, "struct co5300fb_render_stats {"), block(driver, "struct co5300fb {")]
+for name in ("co5300fb_command", "co5300fb_render", "co5300fb_measure_render", "co5300fb_flush", "co5300fb_damage",
              "co5300fb_damage_range", "co5300fb_damage_area"):
     program.append(block(driver, name))
 start = driver.index("FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(")
