@@ -139,9 +139,11 @@ Description:
 		current window, pulses physical reset low for 10..11 ms, releases
 		reset, waits 150 ms, replays the same validated supplier init used at
 		probe (including its delays), then sends DISPON. With the standard
-		sequence this restores FE/C4/3A/34/53/51/63/11/29 and takes about
+		sequence this restores 36/FE/C4/3A/34/53/51/63/11/29 and takes about
 		760 ms plus transport. TE-off (34h) has no parameter, including at
 		probe; the other supplier commands and delays retain their order.
+		MADCTL (36h=00h) explicitly selects RGB/native axes as in ESP-IDF;
+		the configured rotation is applied in software.
 		An active direct pattern is replayed after success; otherwise a full
 		framebuffer redraw is queued. Failure releases the test hold and
 		queues a framebuffer redraw. GPIO/SPI/sequence errors propagate;

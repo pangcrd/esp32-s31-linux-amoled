@@ -215,13 +215,13 @@ static int spi_sync_transfer(struct spi_device *spi, struct spi_transfer *t, uns
     (void)spi;
     if (!locked_mutex) fail("SPI must hold io_lock");
     const u8 *b = t[0].tx_buf;
-    if (recovering && init_phase < 9) {
-        static const u8 commands[] = { 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
-        static const u8 values[] = { 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
+    if (recovering && init_phase < 10) {
+        static const u8 commands[] = { 0x36, 0xfe, 0xc4, 0x3a, 0x34, 0x53, 0x51, 0x63, 0x11, 0x29 };
+        static const u8 values[] = { 0, 0, 0x80, 0x55, 0, 0x20, 0xff, 0xff };
         unsigned i = init_phase++;
-        if (n != 1 || t[0].len != (i < 7 && i != 3 ? 5 : 4) ||
+        if (n != 1 || t[0].len != (i < 8 && i != 4 ? 5 : 4) ||
             t[0].tx_nbits != 1 || b[0] != 2 || b[1] || b[2] != commands[i] || b[3] ||
-            (i < 7 && i != 3 && b[4] != values[i])) fail("TE-off supplier init before Tux RAMWR");
+            (i < 8 && i != 4 && b[4] != values[i])) fail("RGB/native axes and TE-off init before Tux RAMWR");
         return 0;
     }
     if (phase < 2) {
@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
     p.panel_test_active = true; p.panel_test_mode = 2;
     memset(p.pixels, 0, 411640);
     phase = 0; recovering = true;
-    if (panel_reinit_draw_store(&spi.dev, NULL, "1\n", 2) != 2 || init_phase != 9 || phase != 3 ||
+    if (panel_reinit_draw_store(&spi.dev, NULL, "1\n", 2) != 2 || init_phase != 10 || phase != 3 ||
         reset_calls != 1 || reset_us != 10000 || sleep_ms != 750 || reset_raw != 1 ||
         lock_calls != locks + 1 || locked_mutex || p.io_lock.locked ||
         scheduled != queued || !info.deferred_work.pending || !p.dirty ||

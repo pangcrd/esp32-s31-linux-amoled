@@ -29,9 +29,11 @@
 		chipone,x-offset = <0>;
 		chipone,y-offset = <22>;
 		/* Record format: [cmd, len, delay-ms BE16, data...].
+		 * Explicit MADCTL=00h matches IDF: RGB order, native axes.
 		 * TE-off is parameterless 34h; 35h=00h enables TE output.
 		 */
-		chipone,init-sequence = [fe 01 00 00 00 c4 01 00 00 80
+		chipone,init-sequence = [36 01 00 00 00
+					  fe 01 00 00 00 c4 01 00 00 80
 					  3a 01 00 00 55
 					  34 00 00 00 53 01 00 00 20
 					  51 01 00 00 ff 63 01 00 00 ff

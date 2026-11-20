@@ -98,6 +98,8 @@ static bool dma_enable = true;
 static unsigned int syncs, chunks, legacy, rescheds, target_calls, dma_calls;
 static unsigned int fail_stage, error_calls, stage, ticks, wanted_lanes;
 static unsigned int soft_resets;
+static bool wanted_keep_tail;
+static unsigned int wanted_internal_cs = 2;
 static bool error_mode;
 static u32 regs[64];
 static const u8 *expected;
@@ -126,6 +128,11 @@ static void emit(void) {
     if (wanted_lanes &&
         !!(regs[S31_SPI_USER/4] & S31_SPI_FWRITE_QUAD) != (wanted_lanes == 4))
         fail("single / quad lane configuration");
+    bool keep = emitted + len < expected_len || wanted_keep_tail;
+    if (!!(regs[S31_SPI_MISC/4] & S31_SPI_CS_KEEP_ACTIVE) != keep ||
+        (regs[S31_SPI_MISC/4] & S31_SPI_CS_DIS_MASK) !=
+        (S31_SPI_CS_DIS_MASK & ~BIT(wanted_internal_cs)))
+        fail("internal CS must survive header/data and FIFO boundaries, including GPIO CS");
     if (len % 4) {
         for (unsigned int i=len; i<(len+3)/4*4; i++)
             if (fifo[i]) fail("short FIFO tail must be zero-padded");
@@ -191,7 +198,11 @@ static int esp32s31_spi_target_transfer(struct spi_controller *c,
 }
 static int esp32s31_spi_dma_transfer(struct esp32s31_spi *s, struct spi_controller *c,
                                     struct spi_transfer *t, u32 misc) {
-    (void)s; (void)c; (void)t; (void)misc; dma_calls++; return 0;
+    (void)s; (void)c; (void)t;
+    if (!!(misc & S31_SPI_CS_KEEP_ACTIVE) != wanted_keep_tail ||
+        (misc & S31_SPI_CS_DIS_MASK) != (S31_SPI_CS_DIS_MASK & ~BIT(wanted_internal_cs)))
+        fail("DMA must retain the same internal CS transaction boundaries as PIO");
+    dma_calls++; return 0;
 }
 static int esp32s31_spi_dma_tx_sg(struct esp32s31_spi *s, struct spi_controller *c,
                                   struct spi_transfer *t, u32 misc) {
@@ -238,6 +249,22 @@ int main(void) {
             }
         }
     }
+    /* Match the SPI API at transfer boundaries for GPIO and native CS:
+     * intermediate cs_change toggles CS; final cs_change retains it. */
+    for (unsigned int gpio=0; gpio<2; gpio++) {
+        spi.gpio_cs = gpio; wanted_internal_cs = gpio ? 2 : 0;
+        for (unsigned int last=0; last<2; last++) {
+            for (unsigned int change=0; change<2; change++) {
+                t.last = last; t.cs_change = change; t.len = 137;
+                wanted_keep_tail = last ? change : !change;
+                reset_capture(t.tx_buf, t.len);
+                if (esp32s31_spi_transfer_one(&ctlr, &spi, &t) || emitted != 137 || chunks != 3)
+                    fail("CS retention across multiple FIFO chunks");
+            }
+        }
+    }
+    spi.gpio_cs = true; wanted_internal_cs = 2;
+    t.last = true; t.cs_change = false; wanted_keep_tail = false;
     /* Recovery from UPDATE, TRANS_DONE or USR stalls uses the actual reset helper. */
     for (fail_stage=1; fail_stage<=3; fail_stage++) {
         t.len=64; reset_capture(t.tx_buf,t.len);
@@ -272,6 +299,21 @@ int main(void) {
     t.tx_buf=storage; t.rx_buf=NULL; t.len=128; reset_capture(storage,t.len);
     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t) || dma_calls!=1 || syncs)
         fail("DMA path preserved");
+    /* Actual transfer_one selects the flags passed into SG DMA for all
+     * thirteen RGB565 chunks, preserving the header-to-data transaction. */
+    unsigned int left = 411640, total = 0, transfers = 0;
+    t.tx_nbits = 4; wanted_lanes = 4; t.tx_sg_mapped = true;
+    while (left) {
+        t.len = left > 32768 ? 32768 : left;
+        t.last = left == t.len; wanted_keep_tail = !t.last;
+        reset_capture(storage + total, t.len);
+        t.tx_buf = storage + total;
+        if (esp32s31_spi_transfer_one(&ctlr, &spi, &t) || dma_calls != 1)
+            fail("RGB565 SG DMA CS boundary");
+        total += t.len; left -= t.len; transfers++;
+    }
+    if (total != 411640 || transfers != 13) fail("full RGB565 frame segmentation");
+    t.tx_sg_mapped = false; wanted_keep_tail = false;
     state.tx_dma=state.rx_dma=NULL;
     t.len=SZ_512K+1;
     if (esp32s31_spi_transfer_one(&ctlr,&spi,&t)!=-EMSGSIZE)
@@ -281,6 +323,7 @@ int main(void) {
         fail("quad full duplex rejected");
     free(storage); free(rx);
     puts("PASS: exact full-frame/aligned/unaligned/tail FIFO bytes; single/quad;"
+         " GPIO/native internal CS retention across header/FIFO/13 DMA chunks;"
          " UPDATE -> RAW -> USR; timeout reset; IRQ sync once; legacy/DMA/target limits");
     return 0;
 }

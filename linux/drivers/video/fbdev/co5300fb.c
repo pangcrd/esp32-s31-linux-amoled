@@ -793,10 +793,12 @@ static const struct fb_ops co5300fb_ops = {
 static int co5300fb_init_sequence(struct co5300fb *p)
 {
 	static const u8 defaults[] = {
-		/* Supplier order with TE disabled from initialization: 34h has
+		/* IDF explicitly selects MADCTL=00h (RGB, native axes). Rotation
+		 * remains in software. Supplier order with TE disabled: 34h has
 		 * no parameter; 35h=00h would enable vertical-blank TE output.
-		 * Rotation is software only. Display On (0x29) follows this table.
+		 * Display On (0x29) follows this table.
 		 */
+		0x36, 1, 0, 0, 0x00,
 		0xfe, 1, 0, 0, 0x00,
 		0xc4, 1, 0, 0, 0x80,
 		0x3a, 1, 0, 0, 0x55,

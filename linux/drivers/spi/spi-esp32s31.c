@@ -885,7 +885,10 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 		misc |= BIT(cs + 7);
 	if (spi->mode & SPI_CPOL)
 		misc |= S31_SPI_CK_IDLE_EDGE;
-	if (!gpio_cs && !xfer->cs_change && !spi_transfer_is_last(ctlr, xfer))
+	/* Keep the internal CS/state machine active as IDF does between LCD
+	 * header and data transactions, even when the pad CS belongs to gpiolib.
+	 * A final cs_change requests retention across messages in the SPI API. */
+	if (spi_transfer_is_last(ctlr, xfer) ? xfer->cs_change : !xfer->cs_change)
 		misc |= S31_SPI_CS_KEEP_ACTIVE;
 	/* Route mapped TX by the mapping, even if dma_enable changes mid-message. */
 	if (xfer->tx_buf && !xfer->rx_buf && xfer->tx_sg_mapped)
@@ -909,8 +912,8 @@ static int esp32s31_spi_transfer_one(struct spi_controller *ctlr,
 	for (offset = 0; offset < xfer->len; offset += S31_SPI_FIFO_SIZE) {
 		unsigned int chunk = min_t(unsigned int, S31_SPI_FIFO_SIZE,
 					       xfer->len - offset);
-		bool keep_active = !gpio_cs && (offset + chunk < xfer->len ||
-			(!xfer->cs_change && !spi_transfer_is_last(ctlr, xfer)));
+		bool keep_active = offset + chunk < xfer->len ||
+				   (misc & S31_SPI_CS_KEEP_ACTIVE);
 
 		writel(misc | (keep_active ? S31_SPI_CS_KEEP_ACTIVE : 0),
 		       s->base + S31_SPI_MISC);
