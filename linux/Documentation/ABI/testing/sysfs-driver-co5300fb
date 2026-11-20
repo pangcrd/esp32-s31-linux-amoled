@@ -5,7 +5,8 @@ Description:
 		Read-only CO5300 framebuffer flush statistics. Output consists of
 		newline-separated key=value fields in four lines.
 
-		flushes counts attempted dirty-range and panel_reinit_draw flushes;
+		flushes counts attempted dirty-range, panel_reinit_draw and
+		update_hold release flushes;
 		errors counts failed flushes. rows gives the last logical first..last
 		row range and bytes is the requested pixel payload, including
 		unchanged alignment rows.
@@ -175,3 +176,27 @@ Description:
 		command logs are suppressed so fbcon cannot overwrite login pixels.
 		Success reports completed SPI submission, not panel reception. Root
 		permission is required. Runs only on explicit request.
+
+What:		/sys/bus/spi/devices/.../update_hold
+Date:		November 2026
+Contact:	ESP32-S31 Linux maintainers
+Description:
+		Write-only framebuffer update transaction, also accessible through
+		/sys/class/graphics/fbN/device/update_hold. Decimal 1 waits for the
+		current transfer and holds normal display updates. It sends no SPI
+		commands or pixels. fbcon, writes and mmap continue updating memory;
+		dirty callbacks send no intermediate frame while held. Decimal 0
+		releases the hold and renders/sends one complete current framebuffer
+		synchronously under io_lock, even if deferred callbacks consumed its
+		damage. It does not reset or reinitialize the panel. The login wrapper
+		uses it around clear, spacing and splash to retain the boot display
+		until the completed login frame is ready. It is inactive at probe.
+
+		Repeated 1 keeps the hold; 0 when inactive sends nothing. An active
+		panel_test remains active and suppresses the release transfer until
+		panel_test is released. Existing pending work remains pending.
+		Missing buffers return ENODEV and retain the hold. SPI errors on
+		release propagate and leave updates enabled. Other values return
+		EINVAL without changing state. Successful release transfers count
+		in normal flush_stats/render_stats; held skips do not. Root permission
+		is required. The wrapper releases on splash failure or interruption.

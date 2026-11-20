@@ -269,15 +269,22 @@ with tempfile.TemporaryDirectory(prefix="co5300-splash-test-") as directory:
     event = temp / "event"
     getty = temp / "getty"
     splash = temp / "splash"
-    expected_clear = b"\x1b[0m\x1b[2J\x1b[H\x1b[3J\n\n\n"
+    expected_clear = b"\x1b[0m\x1b[2J\x1b[H\x1b[3J\n\n"
     splash.write_text("#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
                       f"assert Path({str(tty)!r}).read_bytes() == {expected_clear!r}\n"
+                      "control = Path(os.environ['HOLD_FILE'])\n"
+                      "assert not control.exists() or control.read_text() == '1\\n'\n"
                       "assert sys.argv[1:] == ['--at', '150,120', '--persist', "
                       "'/usr/share/co5300-splash/tux.rgb565', '230', '240']\n"
                       f"Path({str(event)!r}).write_text('draw\\n')\n"
+                      "if os.environ.get('INTERRUPT') == '1':\n"
+                      " import signal\n signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      " os.kill(os.getppid(), signal.SIGTERM)\n"
                       "sys.exit(int(os.environ['SPLASH_FAIL']))\n")
     getty.write_text("#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
                      "assert sys.argv[1:] == ['-L', 'tty0', '115200', 'vt100']\n"
+                     "control = Path(os.environ['HOLD_FILE'])\n"
+                     "assert not control.exists() or control.read_text() == '0\\n'\n"
                      f"p = Path({str(event)!r})\nassert p.read_text() == 'draw\\n'\n"
                      "p.write_text(f'draw\\ngetty {os.getpid()}\\n')\n")
     splash.chmod(0o755)
@@ -285,16 +292,43 @@ with tempfile.TemporaryDirectory(prefix="co5300-splash-test-") as directory:
     wrapper = temp / "wrapper"
     text = (repo / "br2-external/board/esp32s31/amoled-getty").read_text()
     # A tty consumes successive writes; append emulates that on a regular file.
-    wrapper.write_text(text.replace("> /dev/tty0", ">> " + shlex.quote(str(tty)))
-                      .replace("/usr/bin/co5300-splash", shlex.quote(str(splash)))
-                      .replace("/sbin/getty", shlex.quote(str(getty))))
-    for failed in (0, 1):
-        tty.write_bytes(b"")
-        process = subprocess.Popen(["sh", str(wrapper)], stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, env=dict(os.environ, SPLASH_FAIL=str(failed)))
-        out, err = process.communicate(timeout=10)
-        assert process.returncode == 0, (out, err)
-        assert event.read_text() == f"draw\ngetty {process.pid}\n"
-        assert tty.read_bytes() == expected_clear
-        assert bool(err) == bool(failed)
-    print("PASS: login wrapper clears before drawing, never clears after drawing, and execs getty on success/failure")
+    for controls in (0, 1):
+        panel = temp / f"panel{controls}"
+        panel.mkdir()
+        hold_file = panel / "update_hold"
+        if controls:
+            hold_file.write_text("0\n")
+        wrapper.write_text(text.replace("> /dev/tty0", ">> " + shlex.quote(str(tty)))
+                          .replace("panel=/sys/class/graphics/fb0/device", "panel=" + shlex.quote(str(panel)))
+                          .replace("/usr/bin/co5300-splash", shlex.quote(str(splash)))
+                          .replace("/sbin/getty", shlex.quote(str(getty))))
+        for failed in (0, 1):
+            tty.write_bytes(b"")
+            process = subprocess.Popen(["sh", str(wrapper)], stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE,
+                                       env=dict(os.environ, SPLASH_FAIL=str(failed), HOLD_FILE=str(hold_file)))
+            out, err = process.communicate(timeout=10)
+            assert process.returncode == 0, (out, err)
+            assert event.read_text() == f"draw\ngetty {process.pid}\n"
+            assert tty.read_bytes() == expected_clear
+            assert bool(err) == bool(failed)
+        if controls:
+            tty.write_bytes(b"")
+            process = subprocess.Popen(["sh", str(wrapper)], stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, env=dict(os.environ, SPLASH_FAIL="0",
+                                                                       HOLD_FILE=str(hold_file), INTERRUPT="1"))
+            out, err = process.communicate(timeout=10)
+            assert process.returncode == 1, (out, err)
+            assert hold_file.read_text() == "0\n" and event.read_text() == "draw\n"
+    # BusyBox 1.37 libbb/login.c print_login_issue emits a newline even
+    # before opening /etc/issue. Its trailing newline advances the prompt.
+    issue = (repo / "br2-external/board/esp32s31/rootfs-overlay-coreboard1/etc/issue").read_bytes()
+    assert b"\x1b" not in issue and issue.count(b"\n") == 1
+    assert max(len(line) for line in issue.split(b"\n")) < 502 // 12
+    start_row = expected_clear.count(b"\n")
+    banner_row = start_row + 1
+    prompt_row = banner_row + issue.count(b"\n")
+    assert banner_row * 22 >= 40 and (prompt_row + 1) * 22 <= 120
+    assert (3 + 1 + issue.count(b"\n") + 1) * 22 > 120, "old three-line spacing overlaps Tux"
+    print("PASS: login transaction holds before drawing, releases before exec getty on success/failure,"
+          " releases on interruption, supports older kernels; BusyBox issue newline puts text above Tux")

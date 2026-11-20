@@ -260,6 +260,15 @@ static void drain(struct fb_info *info, struct list_head *pages) {
     if (phase != 3 || p->stats.errors || p->stats.full_flushes != before + 1)
         fail("dirty bytes/glyphs must reach one successful full SPI frame");
 }
+static void drain_held(struct fb_info *info, struct list_head *pages) {
+    struct co5300fb *p = info->par;
+    u64 before = p->stats.flushes;
+    phase = 0;
+    info->deferred_work.pending = false;
+    co5300fb_deferred_io(info, pages);
+    if (phase || p->stats.flushes != before || p->dirty)
+        fail("held clear/row-write callbacks must not submit intermediate pixels");
+}
 int main(int argc, char **argv) {
     if (argc != 2) fail("Tux argument");
     struct spi_device spi = {0};
@@ -291,8 +300,9 @@ int main(int argc, char **argv) {
     pos = 0;
     if (info.fbops->fb_read(&info, readback, 411640, &pos) != 411640 || memcmp(readback, white, 411640)) fail("full-screen readback");
     drain(&info, &pages);
+    if (update_hold_store(&spi.dev, NULL, "1", 1) != 1) fail("hold login assembly");
     struct fb_fillrect clear = { .width = 502, .height = 410, .color = 0 };
-    info.fbops->fb_fillrect(&info, &clear); dirty(&info, 0, 409); drain(&info, &pages);
+    info.fbops->fb_fillrect(&info, &clear); dirty(&info, 0, 409); drain_held(&info, &pages);
     for (unsigned i = 0; i < 411640; i++) if (info.screen_buffer[i]) fail("clear must write black to the shared backing buffer");
     FILE *file = fopen(argv[1], "rb");
     if (!file || fread(tux, 1, 110400, file) != 110400) fail("Tux read");
@@ -300,13 +310,24 @@ int main(int argc, char **argv) {
     for (unsigned y = 0; y < 240; y++) {
         pos = (120 + y) * 1004 + 150 * 2;
         if (info.fbops->fb_write(&info, tux + y * 460, 460, &pos) != 460) fail("Tux row write");
+        /* Force the worst scheduling: a callback after every written row. */
+        drain_held(&info, &pages);
     }
-    dirty(&info, 120, 359);
     for (unsigned y = 0; y < 240; y++) {
         pos = (120 + y) * 1004 + 300;
         if (info.fbops->fb_read(&info, readback, 460, &pos) != 460 || memcmp(readback, tux + y * 460, 460)) fail("Tux rectangle readback");
     }
     if (((u16 *)info.screen_buffer)[240 * 502 + 265] != 0xffff) fail("known white belly at (265,240)");
+    u64 committed = p.stats.full_flushes;
+    unsigned queued_before = scheduled;
+    phase = 0;
+    if (update_hold_store(&spi.dev, NULL, "0", 1) != 1 || p.update_held || phase != 3 ||
+        p.stats.full_flushes != committed + 1 || p.stats.errors || scheduled != queued_before ||
+        info.deferred_work.pending || p.dirty || p.render_stats.sample_offset != 217638 ||
+        p.render_stats.tx_sample != 0xffff)
+        fail("atomic login commit must send complete Tux after all held callbacks consumed damage");
+    /* Mark a subsequent console update pending for the recovery test. */
+    co5300fb_damage(&info, 0, 409, p.defio.delay);
     /* Run the actual sysfs store while Tux writes are still pending. Its
      * return must mean Tux has already been sent, without draining work. */
     unsigned locks = lock_calls, queued = scheduled;
@@ -360,6 +381,7 @@ int main(int argc, char **argv) {
     free(white); free(readback); free(tux); co5300fb_destroy(&info);
     puts("PASS: actual Linux sysmem/deferred macros, 8-byte/full-frame/Tux writes and readback,"
          " synchronous one-lock reset/init/Tux RAMWR before return with pending work preserved,"
+         " atomic clear + 240 Tux row writes with callbacks between every row,"
          " glyph/fill/copy damage, held-pattern canonical restoration, mmap pages and full-frame RGB565 SPI");
     return 0;
 }
@@ -382,7 +404,7 @@ program += [macros, block(driver, "struct co5300fb_stats {"),
             block(driver, "struct co5300fb_render_stats {"),
             block(driver, "struct co5300fb_panel_test_stats {"), block(driver, "struct co5300fb {")]
 for name in ("co5300fb_command", "co5300fb_write_window", "co5300fb_render", "co5300fb_measure_render",
-             "co5300fb_flush_locked", "co5300fb_flush", "co5300fb_init_sequence",
+             "co5300fb_flush_locked", "co5300fb_flush", "update_hold_store", "co5300fb_init_sequence",
              "co5300fb_reset_and_init", "panel_reinit_draw_store", "co5300fb_damage",
              "co5300fb_damage_range", "co5300fb_damage_area"):
     program.append(block(driver, name))
